@@ -14,25 +14,35 @@ CREATE TABLE pipelines (
   ocr_provider ocr_provider,
   ocr_model text,
   ocr_service_url text,
-  extraction_mode extraction_mode NOT NULL,
-  llm_model text NOT NULL,
+  ocr_prompt text,
+  extraction_enabled boolean NOT NULL DEFAULT true,
+  extraction_mode extraction_mode,
+  llm_model text,
   prompt text,
-  max_tokens integer NOT NULL DEFAULT 2048 CHECK (max_tokens BETWEEN 1 AND 128000),
+  max_tokens integer CHECK (max_tokens IS NULL OR max_tokens BETWEEN 1 AND 128000),
   version integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (
-    (source = 'document' AND ocr_provider IS NULL AND ocr_model IS NULL AND ocr_service_url IS NULL)
+    (source = 'document' AND ocr_provider IS NULL AND ocr_model IS NULL AND ocr_service_url IS NULL AND ocr_prompt IS NULL)
     OR
     (source = 'scans' AND (
-      (ocr_provider = 'litellm' AND ocr_model IS NOT NULL AND ocr_service_url IS NULL)
+      (ocr_provider = 'litellm' AND ocr_model IS NOT NULL AND ocr_prompt IS NOT NULL AND ocr_service_url IS NULL)
       OR
-      (ocr_provider = 'service' AND ocr_service_url IS NOT NULL AND ocr_model IS NULL)
+      (ocr_provider = 'service' AND ocr_service_url IS NOT NULL AND ocr_model IS NULL AND ocr_prompt IS NULL)
     ))
   ),
   CHECK (
-    (extraction_mode = 'prompt' AND prompt IS NOT NULL)
-    OR extraction_mode = 'fields'
+    (extraction_enabled = false AND extraction_mode IS NULL AND llm_model IS NULL AND prompt IS NULL AND max_tokens IS NULL)
+    OR
+    (extraction_enabled = true AND extraction_mode IS NOT NULL AND llm_model IS NOT NULL AND max_tokens IS NOT NULL AND (
+      (extraction_mode = 'prompt' AND prompt IS NOT NULL)
+      OR extraction_mode = 'fields'
+    ))
+  ),
+  CHECK (
+    extraction_enabled = true
+    OR (source = 'scans' AND ocr_provider = 'litellm')
   )
 );
 

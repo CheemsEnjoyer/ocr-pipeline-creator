@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -29,6 +30,8 @@ export default function Home() {
   const [ocrMode, setOcrMode] = useState("litellm");
   const [ocrModel, setOcrModel] = useState("");
   const [ocrServiceUrl, setOcrServiceUrl] = useState("");
+  const [visionPrompt, setVisionPrompt] = useState("Распознай весь текст на изображении, сохрани структуру документа и верни результат без комментариев.");
+  const [skipExtraction, setSkipExtraction] = useState(false);
   const [extractionMode, setExtractionMode] = useState("fields");
   const [prompt, setPrompt] = useState("Проанализируй документ и верни структурированный JSON без дополнительного текста.");
   const [fields, setFields] = useState(initialFields);
@@ -49,21 +52,25 @@ export default function Home() {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    if (sourceType !== "scans" || ocrMode !== "litellm") setSkipExtraction(false);
+  }, [sourceType, ocrMode]);
+
   const isValid = useMemo(() => {
     if (step === 1) return name.trim().length >= 3;
     if (step === 2) return Boolean(sourceType);
-    if (step === 3 && sourceType === "scans") return ocrMode === "litellm" ? Boolean(ocrModel) : /^https?:\/\//.test(ocrServiceUrl);
-    if (step === 4) return Boolean(llmModel) && maxTokens >= 1 && (extractionMode === "prompt" ? prompt.trim().length > 0 : fields.length > 0 && fields.every((field) => field.name.trim() && field.description.trim()));
+    if (step === 3 && sourceType === "scans") return ocrMode === "litellm" ? Boolean(ocrModel) && visionPrompt.trim().length > 0 : /^https?:\/\//.test(ocrServiceUrl);
+    if (step === 4) return skipExtraction || (Boolean(llmModel) && maxTokens >= 1 && (extractionMode === "prompt" ? prompt.trim().length > 0 : fields.length > 0 && fields.every((field) => field.name.trim() && field.description.trim())));
     return true;
-  }, [step, name, sourceType, ocrMode, ocrModel, ocrServiceUrl, llmModel, maxTokens, extractionMode, prompt, fields]);
+  }, [step, name, sourceType, ocrMode, ocrModel, ocrServiceUrl, visionPrompt, skipExtraction, llmModel, maxTokens, extractionMode, prompt, fields]);
 
   const pipeline = {
     name: name.trim(), source: sourceType,
-    ocr: sourceType === "scans" ? (ocrMode === "litellm" ? { provider: "litellm", model: ocrModel } : { provider: "service", url: ocrServiceUrl }) : null,
-    extraction: { mode: extractionMode, model: llmModel, max_tokens: Number(maxTokens), ...(extractionMode === "prompt" ? { prompt } : { fields: fields.map(({ name, description }) => ({ name, description })) }) },
+    ocr: sourceType === "scans" ? (ocrMode === "litellm" ? { provider: "litellm", model: ocrModel, prompt: visionPrompt } : { provider: "service", url: ocrServiceUrl }) : null,
+    extraction: skipExtraction ? null : { mode: extractionMode, model: llmModel, max_tokens: Number(maxTokens), ...(extractionMode === "prompt" ? { prompt } : { fields: fields.map(({ name, description }) => ({ name, description })) }) },
   };
 
-  const next = () => { if (!isValid) return; if (step < 4) setStep(step + 1); else setCreated(true); };
+  const next = () => { if (!isValid) return; if (step === 3 && skipExtraction) setCreated(true); else if (step < 4) setStep(step + 1); else setCreated(true); };
   const addField = () => setFields([...fields, { id: Date.now(), name: "", description: "" }]);
 
   useEffect(() => {
@@ -83,17 +90,17 @@ export default function Home() {
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><ScanText size={21}/></div><div><strong>OCR Flow</strong><span>Создание пайплайна</span></div></div><div className="draft-state"><span/>Черновик сохраняется автоматически</div><Button variant="outline" size="sm">Выйти</Button></header>
     <div className="wizard-layout">
-      <aside className="step-sidebar"><div><p className="eyebrow">НОВЫЙ ПАЙПЛАЙН</p><h2>Ответьте на 4 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => <button key={item.number} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""}`} onClick={() => setStep(item.number)}><span>{step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{item.short}</small></div></button>)}</nav><div className="sidebar-note"><WandSparkles size={17}/><span><strong>Без сложной схемы</strong>Пайплайн создаётся из ответов и готов к запуску.</span></div></aside>
+      <aside className="step-sidebar"><div><p className="eyebrow">НОВЫЙ ПАЙПЛАЙН</p><h2>Ответьте на 4 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => { const disabled = item.number === 4 && skipExtraction; return <button key={item.number} disabled={disabled} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""} ${disabled ? "disabled" : ""}`} onClick={() => !disabled && setStep(item.number)}><span>{disabled ? <X size={14}/> : step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{disabled ? "Отключено в настройках Vision" : item.short}</small></div></button>; })}</nav><div className="sidebar-note"><WandSparkles size={17}/><span><strong>Без сложной схемы</strong>Пайплайн создаётся из ответов и готов к запуску.</span></div></aside>
 
       <section className="question-area"><div className="progress-row"><span>Шаг {step} из 4</span><div><i style={{ width: `${step * 25}%` }}/></div><strong>{step * 25}%</strong></div><div className="question-card">
         {step === 1 && <StepName name={name} setName={setName}/>} 
         {step === 2 && <StepSource sourceType={sourceType} setSourceType={setSourceType}/>} 
-        {step === 3 && <StepOcr sourceType={sourceType} ocrMode={ocrMode} setOcrMode={setOcrMode} ocrModel={ocrModel} setOcrModel={setOcrModel} ocrServiceUrl={ocrServiceUrl} setOcrServiceUrl={setOcrServiceUrl} models={models} modelsLoading={modelsLoading} modelError={modelError}/>} 
+        {step === 3 && <StepOcr sourceType={sourceType} ocrMode={ocrMode} setOcrMode={setOcrMode} ocrModel={ocrModel} setOcrModel={setOcrModel} ocrServiceUrl={ocrServiceUrl} setOcrServiceUrl={setOcrServiceUrl} visionPrompt={visionPrompt} setVisionPrompt={setVisionPrompt} skipExtraction={skipExtraction} setSkipExtraction={setSkipExtraction} models={models} modelsLoading={modelsLoading} modelError={modelError}/>} 
         {step === 4 && <StepExtraction extractionMode={extractionMode} setExtractionMode={setExtractionMode} prompt={prompt} setPrompt={setPrompt} fields={fields} setFields={setFields} addField={addField} llmModel={llmModel} setLlmModel={setLlmModel} maxTokens={maxTokens} setMaxTokens={setMaxTokens} models={models} modelsLoading={modelsLoading} modelError={modelError}/>} 
-        <div className="question-actions"><Button variant="ghost" onClick={() => setStep(Math.max(1, step - 1))} disabled={step === 1}><ArrowLeft size={16}/>Назад</Button><div>{!isValid && <span className="validation-hint">Заполните обязательные поля</span>}<Button onClick={next} disabled={!isValid}>{step === 4 ? "Создать пайплайн" : "Продолжить"}{step < 4 && <ArrowRight size={16}/>}</Button></div></div>
+        <div className="question-actions"><Button variant="ghost" onClick={() => setStep(Math.max(1, step - 1))} disabled={step === 1}><ArrowLeft size={16}/>Назад</Button><div>{!isValid && <span className="validation-hint">Заполните обязательные поля</span>}<Button onClick={next} disabled={!isValid}>{step === 4 || (step === 3 && skipExtraction) ? "Создать пайплайн" : "Продолжить"}{step < 4 && !(step === 3 && skipExtraction) && <ArrowRight size={16}/>}</Button></div></div>
       </div></section>
 
-      <aside className="summary-panel"><div className="summary-head"><span>КОНФИГУРАЦИЯ</span><strong>{name.trim() || "Без названия"}</strong></div><SummaryRow number="01" label="Источник" value={sourceType === "scans" ? "Сканы и изображения" : "Цифровой документ"}/><SummaryRow number="02" label="Получение текста" value={sourceType !== "scans" ? "Прямое извлечение" : ocrMode === "litellm" ? (ocrModel || "Модель не выбрана") : (ocrServiceUrl || "Сервис не указан")}/><SummaryRow number="03" label="Извлечение данных" value={extractionMode === "prompt" ? "Свободный промпт" : `${fields.length} параметра`}/><SummaryRow number="04" label="LLM" value={llmModel || "Модель не выбрана"}/><div className="token-summary"><span>Лимит ответа</span><strong>{Number(maxTokens).toLocaleString("ru-RU")} tokens</strong></div></aside>
+      <aside className="summary-panel"><div className="summary-head"><span>КОНФИГУРАЦИЯ</span><strong>{name.trim() || "Без названия"}</strong></div><SummaryRow number="01" label="Источник" value={sourceType === "scans" ? "Сканы и изображения" : "Цифровой документ"}/><SummaryRow number="02" label="Получение текста" value={sourceType !== "scans" ? "Прямое извлечение" : ocrMode === "litellm" ? (ocrModel || "Модель не выбрана") : (ocrServiceUrl || "Сервис не указан")}/><SummaryRow number="03" label="Извлечение данных" value={skipExtraction ? "Отключено — ответ Vision финальный" : extractionMode === "prompt" ? "Свободный промпт" : `${fields.length} параметра`}/><SummaryRow number="04" label="LLM" value={skipExtraction ? "Не используется" : llmModel || "Модель не выбрана"}/><div className="token-summary"><span>{skipExtraction ? "Финальный результат" : "Лимит ответа"}</span><strong>{skipExtraction ? "Ответ Vision-модели" : `${Number(maxTokens).toLocaleString("ru-RU")} tokens`}</strong></div></aside>
     </div>
   </main>;
 }
@@ -102,9 +109,9 @@ function StepName({ name, setName }) { return <div className="step-content"><Ste
 
 function StepSource({ sourceType, setSourceType }) { return <div className="step-content"><StepHeading icon={FileText} kicker="ТИП ИСХОДНЫХ ФАЙЛОВ" title="Откуда нужно получить текст?" copy="От ответа зависит, потребуется ли этап OCR."/><RadioGroup value={sourceType} onValueChange={setSourceType} className="choice-grid"><ChoiceCard value="scans" icon={Image} title="Сканы или изображения" copy="PNG, JPG и PDF-сканы без текстового слоя" badge="Потребуется OCR"/><ChoiceCard value="document" icon={FileText} title="Цифровой документ" copy="PDF, DOCX, TXT и другие файлы с текстом" badge="Текст извлекается напрямую"/></RadioGroup></div>; }
 
-function StepOcr({ sourceType, ocrMode, setOcrMode, ocrModel, setOcrModel, ocrServiceUrl, setOcrServiceUrl, models, modelsLoading, modelError }) {
+function StepOcr({ sourceType, ocrMode, setOcrMode, ocrModel, setOcrModel, ocrServiceUrl, setOcrServiceUrl, visionPrompt, setVisionPrompt, skipExtraction, setSkipExtraction, models, modelsLoading, modelError }) {
   if (sourceType !== "scans") return <div className="step-content"><StepHeading icon={Check} kicker="OCR НЕ ПОТРЕБУЕТСЯ" title="Текст извлечём напрямую" copy="Вы выбрали цифровые документы. Система прочитает их текстовый слой без распознавания изображения."/><div className="skip-card"><FileText size={24}/><div><strong>Извлечение текста из документа</strong><span>PDF · DOCX · TXT · HTML</span></div><Check size={20}/></div></div>;
-  return <div className="step-content"><StepHeading icon={ScanText} kicker="РАСПОЗНАВАНИЕ" title="Как будем распознавать сканы?" copy="Используйте vision-модель через LiteLLM или подключите отдельный OCR-сервис."/><RadioGroup value={ocrMode} onValueChange={setOcrMode} className="method-grid"><MethodCard value="litellm" title="Vision-модель LiteLLM" copy="Выберите одну из доступных моделей"/><MethodCard value="service" title="Внешний OCR-сервис" copy="Укажите HTTP endpoint своего сервиса"/></RadioGroup>{ocrMode === "litellm" ? <ModelField label="OCR-модель" value={ocrModel} setValue={setOcrModel} models={models} modelsLoading={modelsLoading} modelError={modelError}/> : <div className="main-field"><Label htmlFor="ocr-url">URL OCR-сервиса</Label><Input id="ocr-url" value={ocrServiceUrl} onChange={(event) => setOcrServiceUrl(event.target.value)} placeholder="https://ocr.example.com/v1/recognize"/><small>Сервис должен принимать файл по HTTPS и возвращать распознанный текст.</small></div>}</div>;
+  return <div className="step-content"><StepHeading icon={ScanText} kicker="РАСПОЗНАВАНИЕ" title="Как будем распознавать сканы?" copy="Используйте vision-модель через LiteLLM или подключите отдельный OCR-сервис."/><RadioGroup value={ocrMode} onValueChange={setOcrMode} className="method-grid"><MethodCard value="litellm" title="Vision-модель LiteLLM" copy="Выберите одну из доступных моделей"/><MethodCard value="service" title="Внешний OCR-сервис" copy="Укажите HTTP endpoint своего сервиса"/></RadioGroup>{ocrMode === "litellm" ? <><ModelField label="OCR-модель" value={ocrModel} setValue={setOcrModel} models={models} modelsLoading={modelsLoading} modelError={modelError}/><div className="prompt-box vision-prompt"><Label htmlFor="vision-prompt">Промпт для Vision-модели</Label><Textarea id="vision-prompt" rows={4} value={visionPrompt} onChange={(event) => setVisionPrompt(event.target.value)} placeholder="Опишите, как распознать изображение и в каком виде вернуть результат…"/><small>{visionPrompt.length} / 4 000</small></div><div className="skip-extraction"><div><strong>Ответ Vision-модели уже финальный</strong><span>Отключить шаг 4 «Извлечение» и использовать ответ распознавания как результат пайплайна.</span></div><Switch checked={skipExtraction} onCheckedChange={setSkipExtraction} aria-label="Отключить шаг извлечения"/></div></> : <div className="main-field"><Label htmlFor="ocr-url">URL OCR-сервиса</Label><Input id="ocr-url" value={ocrServiceUrl} onChange={(event) => setOcrServiceUrl(event.target.value)} placeholder="https://ocr.example.com/v1/recognize"/><small>Сервис должен принимать файл по HTTPS и возвращать распознанный текст.</small></div>}</div>;
 }
 
 function StepExtraction({ extractionMode, setExtractionMode, prompt, setPrompt, fields, setFields, addField, llmModel, setLlmModel, maxTokens, setMaxTokens, models, modelsLoading, modelError }) {
@@ -116,4 +123,4 @@ function ChoiceCard({ value, icon: Icon, title, copy, badge }) { return <Label c
 function MethodCard({ value, title, copy }) { return <Label className="method-card"><RadioGroupItem value={value}/><div><strong>{title}</strong><span>{copy}</span></div></Label>; }
 function ModelField({ label, value, setValue, models, modelsLoading, modelError }) { return <div className="main-field model-field"><Label>{label}</Label><Select value={value} onValueChange={setValue} disabled={modelsLoading || !models.length}><SelectTrigger><SelectValue placeholder={modelsLoading ? "Загружаем модели…" : "Выберите модель"}/></SelectTrigger><SelectContent>{models.map((model) => <SelectItem key={model} value={model}>{model}</SelectItem>)}</SelectContent></Select><small className={modelError ? "error" : ""}>{modelError || `${models.length} моделей доступно через LiteLLM`}</small></div>; }
 function SummaryRow({ number, label, value }) { return <div className="summary-row"><span>{number}</span><div><small>{label}</small><strong>{value}</strong></div></div>; }
-function PipelineSummary({ pipeline }) { return <div className="final-summary"><div><span>Источник</span><strong>{pipeline.source === "scans" ? "Сканы / изображения" : "Цифровой документ"}</strong></div><div><span>OCR</span><strong>{pipeline.ocr ? (pipeline.ocr.model || pipeline.ocr.url) : "Не требуется"}</strong></div><div><span>Извлечение</span><strong>{pipeline.extraction.mode === "prompt" ? "Промпт" : `${pipeline.extraction.fields.length} параметра`}</strong></div><div><span>LLM</span><strong>{pipeline.extraction.model} · {pipeline.extraction.max_tokens} tokens</strong></div></div>; }
+function PipelineSummary({ pipeline }) { return <div className="final-summary"><div><span>Источник</span><strong>{pipeline.source === "scans" ? "Сканы / изображения" : "Цифровой документ"}</strong></div><div><span>OCR</span><strong>{pipeline.ocr ? (pipeline.ocr.model || pipeline.ocr.url) : "Не требуется"}</strong></div><div><span>Извлечение</span><strong>{pipeline.extraction ? (pipeline.extraction.mode === "prompt" ? "Промпт" : `${pipeline.extraction.fields.length} параметра`) : "Отключено"}</strong></div><div><span>LLM</span><strong>{pipeline.extraction ? `${pipeline.extraction.model} · ${pipeline.extraction.max_tokens} tokens` : "Ответ Vision-модели"}</strong></div></div>; }
