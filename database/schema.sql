@@ -1,62 +1,55 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TYPE pipeline_status AS ENUM ('draft', 'active', 'archived');
+CREATE TYPE source_type AS ENUM ('scans', 'document');
+CREATE TYPE ocr_provider AS ENUM ('litellm', 'service');
+CREATE TYPE extraction_mode AS ENUM ('prompt', 'fields');
 CREATE TYPE run_status AS ENUM ('queued', 'processing', 'completed', 'failed');
-
-CREATE TABLE document_types (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name text NOT NULL UNIQUE,
-  description text,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
 
 CREATE TABLE pipelines (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL,
-  description text,
-  document_type_id uuid REFERENCES document_types(id) ON DELETE SET NULL,
   status pipeline_status NOT NULL DEFAULT 'draft',
+  source source_type NOT NULL,
+  ocr_provider ocr_provider,
+  ocr_model text,
+  ocr_service_url text,
+  extraction_mode extraction_mode NOT NULL,
+  llm_model text NOT NULL,
+  prompt text,
+  max_tokens integer NOT NULL DEFAULT 2048 CHECK (max_tokens BETWEEN 1 AND 128000),
   version integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE pipeline_steps (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  pipeline_id uuid NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
-  step_type text NOT NULL CHECK (step_type IN ('start','ocr','extract','llm','output')),
-  position_x numeric NOT NULL DEFAULT 0,
-  position_y numeric NOT NULL DEFAULT 0,
-  config jsonb NOT NULL DEFAULT '{}'::jsonb,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE pipeline_edges (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  pipeline_id uuid NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
-  source_step_id uuid NOT NULL REFERENCES pipeline_steps(id) ON DELETE CASCADE,
-  target_step_id uuid NOT NULL REFERENCES pipeline_steps(id) ON DELETE CASCADE,
-  source_handle text NOT NULL DEFAULT 'output',
-  target_handle text NOT NULL DEFAULT 'input',
-  condition jsonb,
-  UNIQUE (pipeline_id, source_step_id, target_step_id, source_handle, target_handle),
-  CHECK (source_step_id <> target_step_id)
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (source = 'document' AND ocr_provider IS NULL AND ocr_model IS NULL AND ocr_service_url IS NULL)
+    OR
+    (source = 'scans' AND (
+      (ocr_provider = 'litellm' AND ocr_model IS NOT NULL AND ocr_service_url IS NULL)
+      OR
+      (ocr_provider = 'service' AND ocr_service_url IS NOT NULL AND ocr_model IS NULL)
+    ))
+  ),
+  CHECK (
+    (extraction_mode = 'prompt' AND prompt IS NOT NULL)
+    OR extraction_mode = 'fields'
+  )
 );
 
 CREATE TABLE extraction_fields (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  step_id uuid NOT NULL REFERENCES pipeline_steps(id) ON DELETE CASCADE,
+  pipeline_id uuid NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
   name text NOT NULL,
   description text NOT NULL,
   data_type text NOT NULL DEFAULT 'string',
   required boolean NOT NULL DEFAULT false,
   position integer NOT NULL,
-  UNIQUE (step_id, name)
+  UNIQUE (pipeline_id, name),
+  UNIQUE (pipeline_id, position)
 );
 
 CREATE TABLE documents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  document_type_id uuid REFERENCES document_types(id) ON DELETE SET NULL,
   original_name text NOT NULL,
   object_key text NOT NULL UNIQUE,
   mime_type text NOT NULL,
@@ -76,7 +69,6 @@ CREATE TABLE pipeline_runs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX pipeline_steps_pipeline_idx ON pipeline_steps (pipeline_id, created_at);
-CREATE INDEX pipeline_edges_pipeline_idx ON pipeline_edges (pipeline_id);
+CREATE INDEX extraction_fields_pipeline_idx ON extraction_fields (pipeline_id, position);
 CREATE INDEX pipeline_runs_pipeline_idx ON pipeline_runs (pipeline_id, created_at DESC);
-CREATE INDEX pipeline_runs_status_idx ON pipeline_runs (status) WHERE status IN ('queued','processing');
+CREATE INDEX pipeline_runs_status_idx ON pipeline_runs (status) WHERE status IN ('queued', 'processing');
