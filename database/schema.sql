@@ -25,9 +25,22 @@ CREATE TABLE pipeline_steps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   pipeline_id uuid NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
   step_type text NOT NULL CHECK (step_type IN ('start','ocr','extract','llm','output')),
-  position integer NOT NULL,
+  position_x numeric NOT NULL DEFAULT 0,
+  position_y numeric NOT NULL DEFAULT 0,
   config jsonb NOT NULL DEFAULT '{}'::jsonb,
-  UNIQUE (pipeline_id, position)
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE pipeline_edges (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  pipeline_id uuid NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+  source_step_id uuid NOT NULL REFERENCES pipeline_steps(id) ON DELETE CASCADE,
+  target_step_id uuid NOT NULL REFERENCES pipeline_steps(id) ON DELETE CASCADE,
+  source_handle text NOT NULL DEFAULT 'output',
+  target_handle text NOT NULL DEFAULT 'input',
+  condition jsonb,
+  UNIQUE (pipeline_id, source_step_id, target_step_id, source_handle, target_handle),
+  CHECK (source_step_id <> target_step_id)
 );
 
 CREATE TABLE extraction_fields (
@@ -63,6 +76,7 @@ CREATE TABLE pipeline_runs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX pipeline_steps_pipeline_idx ON pipeline_steps (pipeline_id, position);
+CREATE INDEX pipeline_steps_pipeline_idx ON pipeline_steps (pipeline_id, created_at);
+CREATE INDEX pipeline_edges_pipeline_idx ON pipeline_edges (pipeline_id);
 CREATE INDEX pipeline_runs_pipeline_idx ON pipeline_runs (pipeline_id, created_at DESC);
 CREATE INDEX pipeline_runs_status_idx ON pipeline_runs (status) WHERE status IN ('queued','processing');
