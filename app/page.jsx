@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, ArrowRight, Check, FileInput, FileText, Image, LoaderCircle, Plus, ScanText, Sparkles, Trash2, WandSparkles, X } from "lucide-react";
+import Link from "next/link";
+import { ArrowLeft, ArrowRight, Check, FileInput, FileText, Image, Plus, ScanText, Sparkles, Trash2, X } from "lucide-react";
+import Header from "@/components/Header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { savePipeline } from "@/lib/pipelines";
 
 const stepMeta = [
   { number: 1, title: "Название", short: "Как назвать пайплайн" },
@@ -70,7 +73,8 @@ export default function Home() {
     extraction: skipExtraction ? null : { mode: extractionMode, model: llmModel, max_tokens: Number(maxTokens), ...(extractionMode === "prompt" ? { prompt } : { fields: fields.map(({ name, description }) => ({ name, description })) }) },
   };
 
-  const next = () => { if (!isValid) return; if (step === 3 && skipExtraction) setCreated(true); else if (step < 4) setStep(step + 1); else setCreated(true); };
+  const finish = () => { savePipeline(pipeline); setCreated(true); };
+  const next = () => { if (!isValid) return; if (step === 3 && skipExtraction) finish(); else if (step < 4) setStep(step + 1); else finish(); };
   const addField = () => setFields([...fields, { id: Date.now(), name: "", description: "" }]);
 
   useEffect(() => {
@@ -85,12 +89,12 @@ export default function Home() {
     return () => lifecycle.abort();
   }, []);
 
-  if (created) return <main className="app-shell success-shell"><div className="success-card"><div className="success-icon"><Check size={28}/></div><p className="eyebrow">ПАЙПЛАЙН ГОТОВ</p><h1>{pipeline.name}</h1><p>Конфигурация собрана. Её можно сохранить в PostgreSQL и использовать для обработки документов.</p><PipelineSummary pipeline={pipeline}/><div className="success-actions"><Button variant="outline" onClick={() => setCreated(false)}>Изменить настройки</Button><Button onClick={() => { setCreated(false); setStep(1); setName(""); }}>Создать ещё один</Button></div></div></main>;
+  if (created) return <main className="app-shell success-shell"><div className="success-card"><div className="success-icon"><Check size={28}/></div><p className="eyebrow">ПАЙПЛАЙН ГОТОВ</p><h1>{pipeline.name}</h1><p>Конфигурация собрана. Её можно сохранить в PostgreSQL и использовать для обработки документов.</p><PipelineSummary pipeline={pipeline}/><div className="success-actions"><Button variant="outline" onClick={() => { setCreated(false); setStep(1); setName(""); }}>Создать ещё один</Button><Button asChild><Link href="/process">Загрузить документы<ArrowRight size={16}/></Link></Button></div></div></main>;
 
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><ScanText size={21}/></div><div><strong>OCR Flow</strong><span>Создание пайплайна</span></div></div><div className="draft-state"><span/>Черновик сохраняется автоматически</div><Button variant="outline" size="sm">Выйти</Button></header>
+    <Header subtitle="Создание пайплайна" action={{ href: "/process", label: "Загрузить документы" }}/>
     <div className="wizard-layout">
-      <aside className="step-sidebar"><div><p className="eyebrow">НОВЫЙ ПАЙПЛАЙН</p><h2>Ответьте на 4 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => { const disabled = item.number === 4 && skipExtraction; return <button key={item.number} disabled={disabled} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""} ${disabled ? "disabled" : ""}`} onClick={() => !disabled && setStep(item.number)}><span>{disabled ? <X size={14}/> : step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{disabled ? "Отключено в настройках Vision" : item.short}</small></div></button>; })}</nav><div className="sidebar-note"><WandSparkles size={17}/><span><strong>Без сложной схемы</strong>Пайплайн создаётся из ответов и готов к запуску.</span></div></aside>
+      <aside className="step-sidebar"><div><p className="eyebrow">НОВЫЙ ПАЙПЛАЙН</p><h2>Ответьте на 4 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => { const disabled = item.number === 4 && skipExtraction; return <button key={item.number} disabled={disabled} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""} ${disabled ? "disabled" : ""}`} onClick={() => !disabled && setStep(item.number)}><span>{disabled ? <X size={14}/> : step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{disabled ? "Отключено в настройках Vision" : item.short}</small></div></button>; })}</nav></aside>
 
       <section className="question-area"><div className="progress-row"><span>Шаг {step} из 4</span><div><i style={{ width: `${step * 25}%` }}/></div><strong>{step * 25}%</strong></div><div className="question-card">
         {step === 1 && <StepName name={name} setName={setName}/>} 
