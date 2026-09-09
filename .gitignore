@@ -34,7 +34,8 @@ yarn-error.log*
 
 # vercel
 .vercel
-
+.openai
+.claude
 # typescript
 next-env.d.ts
 /dist/
