@@ -4,7 +4,6 @@ import json
 import logging
 import os
 from typing import Literal
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -43,29 +42,8 @@ class Pipeline(BaseModel):
 
 
 SERVICE_TEXT_KEYS = ("page_content", "text", "result")
-# Адрес сервиса берётся из OCR_SERVICE_URL; путь и модель — часть его контракта.
-OCR_SERVICE_PATH = "/api/v1/ocr/openai/file/process"
-OCR_SERVICE_MODEL = "deepseek-ai/DeepSeek-OCR"
 PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
-
-
-def ocr_services():
-    """Каталог внешних OCR-сервисов для мастера. Пустой, пока OCR_SERVICE_URL не задан в .env."""
-    base = os.getenv("OCR_SERVICE_URL", "").strip().rstrip("/")
-    if not base:
-        return []
-    if not base.startswith(("http://", "https://")):
-        logger.warning("OCR_SERVICE_URL=%s пропущен: адрес должен начинаться с http:// или https://.", base)
-        return []
-    url = base if urlsplit(base).path else f"{base}{OCR_SERVICE_PATH}"
-    return [{
-        "id": "deepseek-ocr",
-        "label": "DeepSeek-OCR",
-        "url": url,
-        "description": f"{OCR_SERVICE_MODEL} · {urlsplit(url).netloc}",
-        "options": {"model_name": OCR_SERVICE_MODEL, "force_ocr": "True"},
-    }]
 
 
 def normalized_proxy(value):

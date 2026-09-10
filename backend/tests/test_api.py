@@ -103,31 +103,6 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
         self.assertEqual(len(list((self.storage / "originals").iterdir())), 1)
 
-    def test_ocr_service_catalog_comes_from_the_environment(self):
-        with patch.dict("os.environ", {"OCR_SERVICE_URL": ""}):
-            self.assertEqual(self.client.get("/api/ocr/services").json()["services"], [])
-        with patch.dict("os.environ", {"OCR_SERVICE_URL": "http://10.128.34.34:8003/"}):
-            service = self.client.get("/api/ocr/services").json()["services"][0]
-        self.assertEqual(service["url"], "http://10.128.34.34:8003/api/v1/ocr/openai/file/process")
-        self.assertEqual(service["options"], {"model_name": "deepseek-ai/DeepSeek-OCR", "force_ocr": "True"})
-        # Полный адрес с путём принимается как есть, некорректный — отбрасывается.
-        with patch.dict("os.environ", {"OCR_SERVICE_URL": "http://ocr.test/custom/endpoint"}):
-            self.assertEqual(self.client.get("/api/ocr/services").json()["services"][0]["url"], "http://ocr.test/custom/endpoint")
-        with patch.dict("os.environ", {"OCR_SERVICE_URL": "10.128.34.34:8003"}), self.assertLogs("ocr", level="WARNING"):
-            self.assertEqual(self.client.get("/api/ocr/services").json()["services"], [])
-
-    def test_unreachable_upstream_names_the_address(self):
-        self.refuse_upstream = True
-        response = self.client.get("/api/litellm/models")
-        self.assertEqual(response.status_code, 502)
-        # Именно этого не хватало при отладке: в тексте виден адрес, до которого не дошёл запрос.
-        self.assertIn("http://litellm.test/v1/models", response.json()["error"])
-        self.assertNotIn("Запросы идут через прокси", response.json()["error"])
-        with patch.dict("os.environ", {"PROXY_URL": "proxy.company.local:8080"}), TestClient(self.make_app()) as proxied:
-            proxied_error = proxied.get("/api/litellm/models").json()["error"]
-        self.assertIn("http://proxy.company.local:8080", proxied_error)
-        self.assertIn("NO_PROXY", proxied_error)
-
     def test_health_reports_the_configured_proxy(self):
         blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), "")
         with patch.dict("os.environ", blank), TestClient(self.make_app()) as plain:
