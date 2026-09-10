@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertCircle, Check, ChevronRight, CloudUpload, FileText, LoaderCircle, Play, Trash2, Workflow } from "lucide-react";
 import Header from "@/components/Header";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { describePipeline, loadPipelines } from "@/lib/pipelines";
+import { describePipeline } from "@/lib/pipelines";
+import { usePipelines } from "@/hooks/use-pipelines";
 
 const ACCEPT = "image/*,application/pdf,.txt,.md,.csv,.json,.html,.docx";
 
@@ -17,20 +18,14 @@ function formatSize(bytes) {
 }
 
 export default function ProcessPage() {
-  const [pipelines, setPipelines] = useState([]);
+  const { pipelines } = usePipelines();
   const [pipelineId, setPipelineId] = useState("");
   const [items, setItems] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [running, setRunning] = useState(false);
   const inputRef = useRef(null);
 
-  useEffect(() => {
-    const stored = loadPipelines();
-    setPipelines(stored);
-    setPipelineId(stored[0]?.id ?? "");
-  }, []);
-
-  const pipeline = useMemo(() => pipelines.find((item) => item.id === pipelineId) ?? null, [pipelines, pipelineId]);
+  const pipeline = useMemo(() => pipelines.find((item) => item.id === pipelineId) ?? pipelines[0] ?? null, [pipelines, pipelineId]);
   const summary = pipeline ? describePipeline(pipeline) : null;
   const canRun = Boolean(pipeline) && items.length > 0 && !running;
 
@@ -102,7 +97,7 @@ export default function ProcessPage() {
           <span>Соберите первый пайплайн в конструкторе — он появится здесь.</span>
           <Button size="sm" asChild><Link href="/">Открыть конструктор<ChevronRight size={15}/></Link></Button>
         </div> : <>
-          <Select value={pipelineId} onValueChange={setPipelineId}>
+          <Select value={pipeline?.id ?? ""} onValueChange={setPipelineId} disabled={running}>
             <SelectTrigger><SelectValue placeholder="Выберите пайплайн"/></SelectTrigger>
             <SelectContent>{pipelines.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || "Без названия"}</SelectItem>)}</SelectContent>
           </Select>
