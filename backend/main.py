@@ -92,7 +92,14 @@ def create_app(database_url=None, data_dir=None, transport=None):
 
     @app.exception_handler(httpx.HTTPError)
     async def upstream_error(_request, error):
-        return JSONResponse({"error": "Сервис OCR или LiteLLM не ответил вовремя" if isinstance(error, httpx.TimeoutException) else "Не удалось подключиться к OCR или LiteLLM. Проверьте адрес, прокси и доступ к сети."}, status_code=502)
+        # 502 означает, что запрос не дошёл: без адреса и прокси в тексте причину не найти.
+        target = getattr(getattr(error, "request", None), "url", None)
+        proxy = getattr(app.state, "proxy", None)
+        logger.warning("Внешний запрос не удался: %s: %s (адрес: %s, прокси: %s)", type(error).__name__, error, target or "неизвестен", proxy or "нет")
+        detail = f"Сервис не ответил вовремя: {target}" if isinstance(error, httpx.TimeoutException) else f"Не удалось подключиться к {target}. Проверьте адрес в .env, прокси и доступ к сети."
+        if proxy:
+            detail += f" Запросы идут через прокси {proxy} — если сервис внутренний, добавьте его хост в NO_PROXY."
+        return JSONResponse({"error": detail}, status_code=502)
 
     @app.exception_handler(SQLAlchemyError)
     async def database_error(_request, error):
@@ -107,7 +114,8 @@ def create_app(database_url=None, data_dir=None, transport=None):
     def health():
         with app.state.sessions() as session:
             session.execute(select(1))
-        return {"status": "ok", "backend": "fastapi-sqlalchemy", "proxy": app.state.proxy}
+        # Адреса из .env видны в health, чтобы не гадать, что именно прочитал сервер. Ключ не отдаём.
+        return {"status": "ok", "backend": "fastapi-sqlalchemy", "proxy": app.state.proxy, "litellm": os.getenv("LITELLM_BASE_URL", "").strip() or None, "ocr_service": os.getenv("OCR_SERVICE_URL", "").strip() or None}
 
     @app.get("/api/documents")
     def documents(page: int = Query(default=0, ge=0)):
