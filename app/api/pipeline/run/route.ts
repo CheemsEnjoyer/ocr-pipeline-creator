@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { documentStorage, saveDocument } from "@/lib/documents";
 
 type Pipeline = {
   name?: string;
@@ -92,13 +93,16 @@ export async function POST(request: NextRequest) {
     const file = form.get("file");
     const rawPipeline = form.get("pipeline");
     if (!(file instanceof File)) return NextResponse.json({ error: "Файл не передан" }, { status: 400 });
+    if (file.size > 20 * 1024 * 1024) return NextResponse.json({ error: "Максимальный размер файла — 20 МБ" }, { status: 413 });
     if (typeof rawPipeline !== "string") return NextResponse.json({ error: "Пайплайн не передан" }, { status: 400 });
 
     const pipeline = JSON.parse(rawPipeline) as Pipeline;
+    documentStorage();
     const text = await recognize(pipeline, file);
     const result = pipeline.extraction ? await extract(pipeline.extraction, text) : text;
 
-    return NextResponse.json({ file: file.name, text, result });
+    const documentId = await saveDocument(file, pipeline.name || "Без названия", text, result);
+    return NextResponse.json({ file: file.name, text, result, documentId });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Не удалось обработать документ" }, { status: 502 });
   }

@@ -16,14 +16,6 @@ function formatSize(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function prettify(value) {
-  try {
-    return JSON.stringify(JSON.parse(value), null, 2);
-  } catch {
-    return value;
-  }
-}
-
 export default function ProcessPage() {
   const [pipelines, setPipelines] = useState([]);
   const [pipelineId, setPipelineId] = useState("");
@@ -60,7 +52,7 @@ export default function ProcessPage() {
         const response = await fetch("/api/pipeline/run", { method: "POST", body });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Обработка не удалась");
-        patch(item.id, { status: "done", result: data.result });
+        patch(item.id, { status: "done", result: data.result, documentId: data.documentId });
       } catch (error) {
         patch(item.id, { status: "error", error: error.message || "Обработка не удалась" });
       }
@@ -69,7 +61,7 @@ export default function ProcessPage() {
   };
 
   return <main className="app-shell">
-    <Header subtitle="Обработка документов" action={{ href: "/", label: "Создать пайплайн" }}/>
+    <Header subtitle="Обработка документов"/>
 
     <div className="process-layout">
       <section className="upload-column">
@@ -84,7 +76,7 @@ export default function ProcessPage() {
         >
           <div className="dropzone-icon"><CloudUpload size={26}/></div>
           <strong>Перетащите файлы сюда</strong>
-          <span>PNG, JPG, PDF, TXT, CSV, JSON — до 20 файлов за раз</span>
+          <span>PNG, JPG, PDF, TXT, CSV, JSON — до 20 МБ на файл</span>
           <input ref={inputRef} type="file" multiple accept={ACCEPT} hidden onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }}/>
         </div>
 
@@ -96,7 +88,7 @@ export default function ProcessPage() {
             <FileStatus status={item.status}/>
             <button className="remove-field" onClick={() => setItems(items.filter((entry) => entry.id !== item.id))} disabled={running} aria-label="Удалить файл"><Trash2 size={16}/></button>
             {item.status === "error" && <p className="file-error"><AlertCircle size={14}/>{item.error}</p>}
-            {item.status === "done" && <pre className="file-result">{prettify(item.result || "")}</pre>}
+            {item.status === "done" && <div className="processed-document-link"><Check size={15}/><span>Сохранён в истории</span><Button variant="outline" size="sm" asChild><Link href={`/history?document=${encodeURIComponent(item.documentId)}`}>Открыть документ<ChevronRight size={15}/></Link></Button></div>}
           </article>)}
         </div>}
       </section>
