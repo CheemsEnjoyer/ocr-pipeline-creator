@@ -55,8 +55,10 @@ async function setup() {
   if (!existsSync(stamp) || readFileSync(stamp, "utf8") !== fingerprint) {
     console.log("Устанавливаем зависимости Python…");
     // Normalize bare corporate proxy addresses for pip as well as the application.
+    // PROXY_URL from .env wins so a single setting covers pip and the outgoing OCR/LiteLLM calls.
     for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) {
-      if (process.env[name] && !process.env[name].includes("://")) process.env[name] = `http://${process.env[name]}`;
+      const value = process.env.PROXY_URL?.trim() || process.env[name];
+      if (value) process.env[name] = value.includes("://") ? value : `http://${value}`;
     }
     await run(python, ["-m", "pip", "install", "-r", "backend/requirements.txt"]);
     writeFileSync(stamp, fingerprint);

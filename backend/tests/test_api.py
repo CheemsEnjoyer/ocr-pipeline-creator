@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import inspect
 
 from backend.main import MAX_FILE_SIZE, create_app
+from backend.processing import proxy_options
 
 
 class APITests(unittest.TestCase):
@@ -91,6 +93,13 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
         self.assertEqual(len(list((self.storage / "originals").iterdir())), 1)
 
+    def test_health_reports_the_configured_proxy(self):
+        blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), "")
+        with patch.dict("os.environ", blank), TestClient(self.make_app()) as plain:
+            self.assertIsNone(plain.get("/api/health").json()["proxy"])
+        with patch.dict("os.environ", {**blank, "PROXY_URL": "proxy.company.local:8080"}), TestClient(self.make_app()) as proxied:
+            self.assertEqual(proxied.get("/api/health").json()["proxy"], "http://proxy.company.local:8080")
+
     def test_models_and_chat(self):
         self.assertEqual(self.client.get("/api/litellm/models").json()["models"], ["extract", "vision"])
         chat = self.client.post("/api/litellm/chat", json={"model": "extract", "prompt": "Извлеки сумму", "documentText": "1500"})
@@ -127,6 +136,42 @@ class APITests(unittest.TestCase):
         response = self.upload(buf.getvalue(), "contract.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("Договор номер 15", response.json()["text"])
+
+
+class ProxyTests(unittest.TestCase):
+    def setUp(self):
+        blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"), "")
+        self.environment = patch.dict("os.environ", blank)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_bare_address_gets_a_scheme_and_wins_over_the_environment(self):
+        os.environ["HTTP_PROXY"] = "old.local:3128"
+        os.environ["PROXY_URL"] = "proxy.company.local:8080"
+        self.assertEqual(proxy_options(), "http://proxy.company.local:8080")
+        self.assertEqual(os.environ["HTTP_PROXY"], "http://proxy.company.local:8080")
+        self.assertEqual(os.environ["HTTPS_PROXY"], "http://proxy.company.local:8080")
+
+    def test_environment_proxy_stays_the_fallback(self):
+        os.environ["HTTPS_PROXY"] = "old.local:3128"
+        self.assertIsNone(proxy_options())
+        self.assertEqual(os.environ["HTTPS_PROXY"], "http://old.local:3128")
+
+    def test_unsupported_scheme_is_ignored(self):
+        os.environ["PROXY_URL"] = "ftp://proxy.company.local:21"
+        with self.assertLogs("ocr", level="WARNING"):
+            self.assertIsNone(proxy_options())
+        self.assertEqual(os.environ["HTTP_PROXY"], "")
+
+    def test_ocr_service_requests_are_routed_through_the_proxy(self):
+        os.environ["PROXY_URL"] = "proxy.company.local:8080"
+        os.environ["NO_PROXY"] = "127.0.0.1"
+        proxy_options()
+        with httpx.Client() as client:
+            routed = client._transport_for_url(httpx.URL("https://ocr.example.com/recognize"))
+            excluded = client._transport_for_url(httpx.URL("http://127.0.0.1:8000/recognize"))
+        self.assertEqual((routed._pool._proxy_url.host, routed._pool._proxy_url.port), (b"proxy.company.local", 8080))
+        self.assertFalse(hasattr(excluded._pool, "_proxy_url"))
 
 
 if __name__ == "__main__":

@@ -63,7 +63,11 @@ def create_app(database_url=None, data_dir=None, transport=None):
             # Idempotent: existing tables and documents are preserved on every restart.
             Base.metadata.create_all(engine)
             app.state.sessions = sessions
-            proxy_options()
+            # PROXY_URL (or HTTP(S)_PROXY) is applied to the environment before the client is built,
+            # so httpx sends the external OCR service and LiteLLM traffic through it.
+            app.state.proxy = proxy_options()
+            if app.state.proxy:
+                logger.info("Внешние запросы идут через прокси %s", app.state.proxy)
             async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15), transport=transport) as client:
                 app.state.client = client
                 yield
@@ -103,7 +107,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
     def health():
         with app.state.sessions() as session:
             session.execute(select(1))
-        return {"status": "ok", "backend": "fastapi-sqlalchemy"}
+        return {"status": "ok", "backend": "fastapi-sqlalchemy", "proxy": app.state.proxy}
 
     @app.get("/api/documents")
     def documents(page: int = Query(default=0, ge=0)):

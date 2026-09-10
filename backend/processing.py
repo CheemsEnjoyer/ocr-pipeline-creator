@@ -1,12 +1,15 @@
 import base64
 import io
 import json
+import logging
 import os
 from typing import Literal
 
 import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, HttpUrl
+
+logger = logging.getLogger("ocr")
 
 
 class ExtractionField(BaseModel):
@@ -36,14 +39,36 @@ class Pipeline(BaseModel):
     extraction: Extraction | None = None
 
 
-def proxy_options():
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
+
+
+def normalized_proxy(value):
     # Corporate Windows environments sometimes supply proxy addresses without a scheme.
-    proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    if proxy and "://" not in proxy:
-        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            value = os.getenv(name)
-            if value and "://" not in value:
-                os.environ[name] = f"http://{value}"
+    value = (value or "").strip()
+    if not value:
+        return None
+    return value if "://" in value else f"http://{value}"
+
+
+def proxy_options():
+    """PROXY_URL is the single knob for the corporate proxy; HTTP(S)_PROXY keep working as a fallback.
+
+    The value is written back into the standard proxy variables, so httpx routes every outgoing
+    request (external OCR service and LiteLLM alike) through it while still honouring NO_PROXY.
+    """
+    for name in PROXY_VARIABLES:
+        value = normalized_proxy(os.getenv(name))
+        if value:
+            os.environ[name] = value
+    proxy = normalized_proxy(os.getenv("PROXY_URL"))
+    if proxy and not proxy.startswith(PROXY_SCHEMES):
+        logger.warning("PROXY_URL=%s пропущен: поддерживаются схемы http, https, socks5.", proxy)
+        return None
+    if proxy:
+        for name in PROXY_VARIABLES:
+            os.environ[name] = proxy
+    return proxy
 
 
 def litellm_config():
