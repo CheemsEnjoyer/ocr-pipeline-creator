@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -22,6 +23,8 @@ class OCR(BaseModel):
     model: str | None = None
     prompt: str | None = None
     url: HttpUrl | None = None
+    # Поля формы конкретного OCR-сервиса (например model_name и force_ocr) — уходят вместе с файлом.
+    options: dict[str, str] = Field(default_factory=dict)
 
 
 class Extraction(BaseModel):
@@ -39,8 +42,30 @@ class Pipeline(BaseModel):
     extraction: Extraction | None = None
 
 
+SERVICE_TEXT_KEYS = ("page_content", "text", "result")
+# Адрес сервиса берётся из OCR_SERVICE_URL; путь и модель — часть его контракта.
+OCR_SERVICE_PATH = "/api/v1/ocr/openai/file/process"
+OCR_SERVICE_MODEL = "deepseek-ai/DeepSeek-OCR"
 PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
+
+
+def ocr_services():
+    """Каталог внешних OCR-сервисов для мастера. Пустой, пока OCR_SERVICE_URL не задан в .env."""
+    base = os.getenv("OCR_SERVICE_URL", "").strip().rstrip("/")
+    if not base:
+        return []
+    if not base.startswith(("http://", "https://")):
+        logger.warning("OCR_SERVICE_URL=%s пропущен: адрес должен начинаться с http:// или https://.", base)
+        return []
+    url = base if urlsplit(base).path else f"{base}{OCR_SERVICE_PATH}"
+    return [{
+        "id": "deepseek-ocr",
+        "label": "DeepSeek-OCR",
+        "url": url,
+        "description": f"{OCR_SERVICE_MODEL} · {urlsplit(url).netloc}",
+        "options": {"model_name": OCR_SERVICE_MODEL, "force_ocr": "True"},
+    }]
 
 
 def normalized_proxy(value):
@@ -130,16 +155,16 @@ async def recognize(client, pipeline, content, filename, mime):
     if ocr.provider == "service":
         if not ocr.url:
             raise HTTPException(422, "Укажите URL OCR-сервиса")
-        response = await client.post(str(ocr.url), files={"file": (filename, content, mime)})
+        response = await client.post(str(ocr.url), files={"file": (filename, content, mime)}, data=ocr.options or None)
         if not response.is_success:
             raise HTTPException(502, f"OCR-сервис вернул HTTP {response.status_code}")
         try:
             payload = response.json()
         except ValueError:
             return response.text
-        text = payload.get("text", payload.get("result", response.text)) if isinstance(payload, dict) else response.text
+        text = next((payload[key] for key in SERVICE_TEXT_KEYS if key in payload), response.text) if isinstance(payload, dict) else response.text
         if not isinstance(text, str):
-            raise HTTPException(502, "OCR-сервис должен вернуть текст в поле text или result")
+            raise HTTPException(502, "OCR-сервис должен вернуть текст в поле page_content, text или result")
         return text
     if not ocr.model:
         raise HTTPException(422, "Выберите vision-модель")

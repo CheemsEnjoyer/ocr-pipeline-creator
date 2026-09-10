@@ -37,7 +37,7 @@ class APITests(unittest.TestCase):
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"data": [{"id": "vision"}, {"id": "extract"}, {"id": "vision"}]})
         if request.url.host == "ocr.test":
-            return httpx.Response(200, json={"text": "Распознанный текст"})
+            return httpx.Response(200, json={"page_content": "Распознанный текст"})
         body = json.loads(request.content)
         content = "Распознанный текст" if body["model"] == "vision" else '{"total": 1500, "verified": false}'
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
@@ -83,15 +83,35 @@ class APITests(unittest.TestCase):
         self.assertEqual(json.loads(self.calls[1].content)["messages"][1]["content"], "Распознанный текст")
 
     def test_ocr_service_and_failure(self):
-        pipeline = {"source": "scans", "ocr": {"provider": "service", "url": "http://ocr.test/recognize"}}
+        options = {"model_name": "deepseek-ai/DeepSeek-OCR", "force_ocr": "True"}
+        pipeline = {"source": "scans", "ocr": {"provider": "service", "url": "http://ocr.test/recognize", "options": options}}
         response = self.upload(b"image", "scan.png", "image/png", pipeline)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"], "Распознанный текст")
+        # Поля сервиса уходят в том же multipart-запросе, что и файл.
+        body = self.calls[0].content.decode("utf-8", "replace")
+        self.assertIn('name="model_name"', body)
+        self.assertIn("deepseek-ai/DeepSeek-OCR", body)
+        self.assertIn('name="force_ocr"', body)
+        self.assertIn('name="file"; filename="scan.png"', body)
         self.fail_upstream = True
         failed = self.upload(b"image", "scan.png", "image/png", pipeline)
         self.assertEqual(failed.status_code, 502)
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
         self.assertEqual(len(list((self.storage / "originals").iterdir())), 1)
+
+    def test_ocr_service_catalog_comes_from_the_environment(self):
+        with patch.dict("os.environ", {"OCR_SERVICE_URL": ""}):
+            self.assertEqual(self.client.get("/api/ocr/services").json()["services"], [])
+        with patch.dict("os.environ", {"OCR_SERVICE_URL": "http://10.128.34.34:8003/"}):
+            service = self.client.get("/api/ocr/services").json()["services"][0]
+        self.assertEqual(service["url"], "http://10.128.34.34:8003/api/v1/ocr/openai/file/process")
+        self.assertEqual(service["options"], {"model_name": "deepseek-ai/DeepSeek-OCR", "force_ocr": "True"})
+        # Полный адрес с путём принимается как есть, некорректный — отбрасывается.
+        with patch.dict("os.environ", {"OCR_SERVICE_URL": "http://ocr.test/custom/endpoint"}):
+            self.assertEqual(self.client.get("/api/ocr/services").json()["services"][0]["url"], "http://ocr.test/custom/endpoint")
+        with patch.dict("os.environ", {"OCR_SERVICE_URL": "10.128.34.34:8003"}), self.assertLogs("ocr", level="WARNING"):
+            self.assertEqual(self.client.get("/api/ocr/services").json()["services"], [])
 
     def test_health_reports_the_configured_proxy(self):
         blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), "")

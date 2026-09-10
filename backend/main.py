@@ -18,7 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .database import Base, Document, open_database
-from .processing import Pipeline, api_url, complete, extract, litellm_config, proxy_options, recognize, result_fields
+from .processing import Pipeline, api_url, complete, extract, litellm_config, ocr_services, proxy_options, recognize, result_fields
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -179,6 +179,10 @@ def create_app(database_url=None, data_dir=None, transport=None):
         result = await extract(app.state.client, parsed.extraction, text) if parsed.extraction else text
         document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result)
         return {"file": filename, "text": text, "result": result, "documentId": document_id}
+
+    @app.get("/api/ocr/services")
+    def services():
+        return {"services": ocr_services()}
 
     @app.get("/api/litellm/models")
     async def models():
