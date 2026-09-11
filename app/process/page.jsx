@@ -98,8 +98,8 @@ export default function ProcessPage() {
           <Button size="sm" asChild><Link href="/">Открыть конструктор<ChevronRight size={15}/></Link></Button>
         </div> : <>
           <Select value={pipeline?.id ?? ""} onValueChange={setPipelineId} disabled={running}>
-            <SelectTrigger><SelectValue placeholder="Выберите пайплайн"/></SelectTrigger>
-            <SelectContent>{pipelines.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || "Без названия"}</SelectItem>)}</SelectContent>
+            <SelectTrigger className="process-pipeline-trigger" aria-label="Выберите пайплайн" title={pipeline?.name || "Без названия"}><SelectValue placeholder="Выберите пайплайн"/></SelectTrigger>
+            <SelectContent className="process-pipeline-menu" position="popper" align="start">{pipelines.map((item) => <SelectItem className="process-pipeline-option" key={item.id} value={item.id}>{item.name || "Без названия"}</SelectItem>)}</SelectContent>
           </Select>
 
           {summary && <div className="pipeline-details">
