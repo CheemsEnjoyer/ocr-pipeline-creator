@@ -19,6 +19,7 @@ class ExtractionField(BaseModel):
 
 class OCR(BaseModel):
     provider: Literal["litellm", "service"]
+    temperature: float = Field(default=0, ge=0, le=2)
     model: str | None = None
     prompt: str | None = None
     url: HttpUrl | None = None
@@ -29,6 +30,7 @@ class OCR(BaseModel):
 class Extraction(BaseModel):
     mode: Literal["prompt", "fields"]
     model: str
+    temperature: float = Field(default=0, ge=0, le=2)
     max_tokens: int = Field(default=2048, ge=1, le=128000)
     prompt: str = ""
     fields: list[ExtractionField] = Field(default_factory=list)
@@ -147,7 +149,7 @@ async def recognize(client, pipeline, content, filename, mime):
     if not ocr.model:
         raise HTTPException(422, "Выберите vision-модель")
     return await complete(client, {
-        "model": ocr.model, "temperature": 0, "max_tokens": 4096,
+        "model": ocr.model, "temperature": ocr.temperature, "max_tokens": 4096,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": ocr.prompt or "Распознай весь текст на изображении."},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"}},
@@ -159,7 +161,7 @@ async def extract(client, extraction, text):
     schema = {field.name: {"type": "string", "description": field.description} for field in extraction.fields}
     instruction = extraction.prompt if extraction.mode == "prompt" else f"Извлеки значения полей по схеме: {json.dumps(schema, ensure_ascii=False)}"
     return await complete(client, {
-        "model": extraction.model, "temperature": 0, "max_tokens": extraction.max_tokens,
+        "model": extraction.model, "temperature": extraction.temperature, "max_tokens": extraction.max_tokens,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": f"{instruction}\nОтвечай только валидным JSON без пояснений."},

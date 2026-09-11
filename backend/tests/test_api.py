@@ -85,6 +85,27 @@ class APITests(unittest.TestCase):
         self.assertTrue(json.loads(self.calls[0].content)["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertEqual(json.loads(self.calls[1].content)["messages"][1]["content"], "Распознанный текст")
 
+    def test_pipeline_temperatures(self):
+        for temperatures in ({}, {"ocr": 0.3, "extraction": 0.8}, {"ocr": 0, "extraction": 2}):
+            with self.subTest(temperatures=temperatures):
+                self.calls.clear()
+                pipeline = {"source": "scans", "ocr": {"provider": "litellm", "model": "vision"}, "extraction": {"mode": "prompt", "model": "extract", "prompt": "JSON"}}
+                for stage, value in temperatures.items():
+                    pipeline[stage]["temperature"] = value
+                response = self.upload(b"image", "scan.png", "image/png", pipeline)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual([json.loads(call.content)["temperature"] for call in self.calls], [temperatures.get("ocr", 0), temperatures.get("extraction", 0)])
+
+    def test_invalid_temperatures_do_not_call_upstream(self):
+        for stage in ("ocr", "extraction"):
+            for value in (-0.1, 2.1, "invalid"):
+                with self.subTest(stage=stage, value=value):
+                    pipeline = {"source": "scans", "ocr": {"provider": "litellm", "model": "vision"}, "extraction": {"mode": "prompt", "model": "extract"}}
+                    pipeline[stage]["temperature"] = value
+                    response = self.upload(b"image", "scan.png", "image/png", pipeline)
+                    self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.calls, [])
+
     def test_ocr_service_and_failure(self):
         options = {"model_name": "deepseek-ai/DeepSeek-OCR", "force_ocr": "True"}
         pipeline = {"source": "scans", "ocr": {"provider": "service", "url": "http://ocr.test/recognize", "options": options}}
