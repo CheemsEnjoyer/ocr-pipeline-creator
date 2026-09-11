@@ -123,7 +123,7 @@ export default function HistoryPage() {
       <aside className="history-list">
         <div className="history-list-heading"><div><h1>Документы</h1><p>Результаты обработки</p></div><History size={20}/></div>
         {error && <div role="alert" className="history-error">{error}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
-        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>История пока пуста</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><Link href="/process">Загрузить документ</Link></Button></div>}
+        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>История пока пуста</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><Link href="/">Загрузить документ</Link></Button></div>}
         {dirty && <p className="history-notice">Сохраните или отмените правки, чтобы выбрать другой документ.</p>}
         <div className="document-list">{documents.map((item) => <button key={item.id} className={`document-row ${selectedId === item.id ? "selected" : ""}`} aria-pressed={selectedId === item.id} disabled={Boolean(dirty) || saving} onClick={() => selectDocument(item.id)}>
           <span className="document-row-icon"><FileText size={19}/></span><span className="document-row-info"><strong>{item.filename}</strong><span>{item.pipeline_name}</span><small>{date(item.created_at)}</small></span><Check size={14} className="document-row-check"/>

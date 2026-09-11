@@ -21,7 +21,7 @@ export default function PipelinesPage() {
     <div className="pipelines-page">
       <div className="pipelines-heading">
         <div><p className="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</p><h1>Сохранённые пайплайны</h1><p>Открывайте, редактируйте и запускайте настроенные сценарии обработки документов.</p></div>
-        <Button asChild><Link href="/"><Plus size={17}/>Создать пайплайн</Link></Button>
+        <Button asChild><Link href="/createpipeline"><Plus size={17}/>Создать пайплайн</Link></Button>
       </div>
 
       {!ready && <p className="history-loading" role="status">Загружаем пайплайны…</p>}
@@ -30,7 +30,7 @@ export default function PipelinesPage() {
         <Workflow size={38}/>
         <strong>Пайплайнов пока нет</strong>
         <p>Соберите первый сценарий в конструкторе — он появится здесь и станет доступен на странице обработки.</p>
-        <Button asChild><Link href="/">Создать пайплайн</Link></Button>
+        <Button asChild><Link href="/createpipeline">Создать пайплайн</Link></Button>
       </div>}
 
       {ready && pipelines.length > 0 && <div className="pipeline-grid">{pipelines.map((pipeline) => {
@@ -46,7 +46,7 @@ export default function PipelinesPage() {
           </dl>
           <div className="pipeline-card-actions">
             <Button variant="outline" size="sm" asChild><Link href={`/pipelines/${encodeURIComponent(pipeline.id)}`}><Pencil size={15}/>Редактировать</Link></Button>
-            <Button variant="ghost" size="sm" asChild><Link href="/process"><Play size={15}/>Обработать</Link></Button>
+            <Button variant="ghost" size="sm" asChild><Link href="/"><Play size={15}/>Обработать</Link></Button>
             <button className="pipeline-card-delete" aria-label={`Удалить пайплайн «${pipeline.name}»`} onClick={() => { setError(""); setRemoving(pipeline); }}><Trash2 size={15}/></button>
           </div>
         </article>;

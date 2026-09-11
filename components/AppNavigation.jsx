@@ -6,9 +6,9 @@ import { History, Layers, ScanText, Workflow } from "lucide-react";
 import { Sidebar, SidebarContent, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarMenuButton, SidebarProvider, useSidebar } from "@/components/ui/sidebar";
 
 const links = [
-  { href: "/", label: "Конструктор", icon: Workflow, match: (pathname) => pathname === "/" },
+  { href: "/", label: "Обработка", icon: ScanText, match: (pathname) => pathname === "/" || pathname === "/process" },
+  { href: "/createpipeline", label: "Конструктор", icon: Workflow, match: (pathname) => pathname === "/createpipeline" },
   { href: "/pipelines", label: "Пайплайны", icon: Layers, match: (pathname) => pathname === "/pipelines" || pathname.startsWith("/pipelines/") },
-  { href: "/process", label: "Обработка", icon: ScanText, match: (pathname) => pathname === "/process" },
   { href: "/history", label: "История документов", icon: History, match: (pathname) => pathname === "/history" },
 ];
 
