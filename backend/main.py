@@ -129,6 +129,9 @@ def create_app(database_url=None, data_dir=None, transport=None):
         # Адреса из .env видны в health, чтобы не гадать, что именно прочитал сервер. Ключ не отдаём.
         return {"status": "ok", "backend": "fastapi-sqlalchemy"}
 
+    # /api/v1 — версионированный API интеграций. Пути без версии остаются для интерфейса
+    # и уже подключённых систем; обработчики у них общие.
+    @app.get("/api/v1/pipelines")
     @app.get("/api/pipelines")
     def list_pipelines(request: Request):
         with app.state.sessions() as session:
@@ -242,11 +245,13 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(404, "Пайплайн не найден")
             return Pipeline.model_validate(row.config)
 
+    @app.post("/api/v1/pipelines/{pipeline_id}/run")
     @app.post("/api/pipelines/{pipeline_id}/run")
     async def run_saved_pipeline(pipeline_id: str, request: Request, file: UploadFile = File()):
         parsed = await run_in_threadpool(stored_pipeline, pipeline_id, request)
         return await process_file(file, parsed)
 
+    @app.post("/api/v1/pipeline/run")
     @app.post("/api/pipeline/run")
     async def run_pipeline(request: Request, file: UploadFile = File(), pipeline: str | None = Form(default=None), pipeline_id: str | None = Form(default=None)):
         if pipeline is not None and not request.state.is_admin:

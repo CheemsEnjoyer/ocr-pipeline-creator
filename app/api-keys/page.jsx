@@ -170,8 +170,8 @@ export default function APIKeysPage() {
         <summary>Как подключить интеграцию</summary>
         <p>Передавайте ключ в заголовке <code>Authorization: Bearer ВАШ_КЛЮЧ</code>.</p>
         <ul>
-          <li><code>GET /api/pipelines</code> — пайплайны, доступные ключу;</li>
-          <li><code>POST /api/pipelines/ID/run</code> — обработка документа из поля формы <code>file</code>.</li>
+          <li><code>GET /api/v1/pipelines</code> — пайплайны, доступные ключу;</li>
+          <li><code>POST /api/v1/pipelines/ID/run</code> — обработка документа из поля формы <code>file</code>.</li>
         </ul>
       </details>
     </div>

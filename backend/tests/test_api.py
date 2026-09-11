@@ -303,6 +303,26 @@ class APITests(unittest.TestCase):
                 self.assertEqual(getattr(integration, method)(url).status_code, 403)
         self.assertEqual(TestClient(self.app).post("/api/auth/login", json={"login": ADMIN_LOGIN, "password": token}).status_code, 401)
 
+    def test_versioned_api_matches_unversioned_paths(self):
+        allowed = self.create_pipeline("Счета")
+        hidden = self.create_pipeline("Договоры")
+        token = self.client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [allowed]}).json()["token"]
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + token})
+        self.assertEqual([pipeline["id"] for pipeline in integration.get("/api/v1/pipelines").json()["pipelines"]], [allowed])
+        by_path = self.send_document(integration, f"/api/v1/pipelines/{allowed}/run")
+        self.assertEqual(by_path.status_code, 200, by_path.text)
+        self.assertEqual(by_path.json()["text"], "Текст документа")
+        self.assertEqual(self.send_document(integration, "/api/v1/pipeline/run", {"pipeline_id": allowed}).status_code, 200)
+        # Ограничения ключа те же, что и на путях без версии.
+        self.assertEqual(self.send_document(integration, f"/api/v1/pipelines/{hidden}/run").status_code, 403)
+        self.assertEqual(self.send_document(integration, "/api/v1/pipeline/run", {"pipeline_id": hidden}).status_code, 403)
+        self.assertEqual(self.send_document(integration, "/api/v1/pipeline/run", {"pipeline": json.dumps({"source": "document"})}).status_code, 403)
+        self.assertEqual(TestClient(self.app).get("/api/v1/pipelines").status_code, 401)
+        # Администратор получает тот же список, а служебные разделы под /api/v1 не публикуются.
+        self.assertEqual(self.client.get("/api/v1/pipelines").json(), self.client.get("/api/pipelines").json())
+        self.assertEqual(self.client.get("/api/v1/keys").status_code, 404)
+        self.assertEqual(self.client.get("/api/v1/documents").status_code, 404)
+
     def test_key_access_can_be_changed_and_revoked(self):
         first = self.create_pipeline("Первый")
         second = self.create_pipeline("Второй")

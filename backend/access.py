@@ -87,8 +87,9 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
             if key is None:
                 raise HTTPException(401, "API-ключ недействителен или отозван")
             request.state.pipeline_ids = list(key.pipeline_ids)
-        allowed = (request.method == "GET" and path == "/api/pipelines") or (
-            request.method == "POST" and (path == "/api/pipeline/run" or re.fullmatch(r"/api/pipelines/[^/]+/run", path))
+        # Основной адрес интеграций — /api/v1; пути без версии разрешены для совместимости.
+        allowed = (request.method == "GET" and path in ("/api/pipelines", "/api/v1/pipelines")) or (
+            request.method == "POST" and (path in ("/api/pipeline/run", "/api/v1/pipeline/run") or re.fullmatch(r"/api(?:/v1)?/pipelines/[^/]+/run", path))
         )
         if not allowed:
             raise HTTPException(403, "Этот API-ключ разрешает только просмотр и запуск назначенных пайплайнов")
