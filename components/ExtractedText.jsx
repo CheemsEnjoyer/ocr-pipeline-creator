@@ -8,7 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 const markdownComponents = {
   a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
   img: ({ src, alt }) => <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Изображение"}</a>,
-  table: ({ children }) => <div className="document-markdown-table"><table>{children}</table></div>,
+  table: ({ children }) => <div className="document-markdown-table" role="region" aria-label="Таблица из документа" tabIndex={0}><table>{children}</table></div>,
 };
 
 export default function ExtractedText({ text }) {

@@ -63,9 +63,9 @@
 .document-markdown code{font-family:var(--font-mono);background:var(--muted);border-radius:4px;padding:.1em .3em;font-size:.9em}
 .document-markdown pre{overflow:auto;background:var(--muted);padding:12px;border-radius:8px;white-space:pre}
 .document-markdown pre code{padding:0;background:transparent}
-.document-markdown-table{max-width:100%;overflow:auto;margin:1em 0}
-.document-markdown table{width:100%;border-collapse:collapse;font-size:13px}
-.document-markdown th,.document-markdown td{border:1px solid var(--border);padding:8px 10px;text-align:left}
+.document-markdown-table{min-width:0;max-width:100%;overflow:auto;margin:1em 0;overscroll-behavior-x:contain}
+.document-markdown table{width:max-content;min-width:100%;border-collapse:collapse;font-size:13px}
+.document-markdown th,.document-markdown td{min-width:120px;max-width:260px;border:1px solid var(--border);padding:8px 10px;text-align:left;vertical-align:top;white-space:normal;overflow-wrap:break-word;word-break:normal;line-height:1.5}
 .document-markdown th{background:var(--muted);font-weight:700}
 .document-markdown hr{margin:1.5em 0;border-top:1px solid var(--border)}
 .document-markdown .contains-task-list{list-style:none}.document-markdown input[type="checkbox"]{margin-right:6px}
