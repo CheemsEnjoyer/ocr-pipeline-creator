@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, ArrowRight, Check, FileInput, FileText, Image, Plus, ScanText, Sparkles, Trash2, X } from "lucide-react";
 import Header from "@/components/Header";
@@ -48,6 +48,8 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelError, setModelError] = useState("");
   const [created, setCreated] = useState(false);
+  const savingRef = useRef(false);
+  const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [savedId, setSavedId] = useState(initialPipeline?.id);
 
@@ -79,14 +81,18 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
     extraction: skipExtraction ? null : { mode: extractionMode, model: llmModel, max_tokens: Number(maxTokens), temperature: Number(extractionTemperature), ...(extractionMode === "prompt" ? { prompt } : { fields: fields.map(({ name, description }) => ({ name, description })) }) },
   };
 
-  const finish = () => {
+  const finish = async () => {
+    if (savingRef.current) return;
     setSaveError("");
     const fieldsValid = fields.length > 0 && fields.every((field) => field.name.trim() && field.description.trim()) && new Set(fields.map((field) => field.name.trim())).size === fields.length;
     if (name.trim().length < 3 || (sourceType === "scans" && (ocrMode === "litellm" ? !ocrModel || !validTemperature(ocrTemperature) || !visionPrompt.trim() : !/^https?:\/\//.test(ocrServiceUrl))) || (!skipExtraction && (!validTemperature(extractionTemperature) || !llmModel || Number(maxTokens) < 1 || Number(maxTokens) > 128000 || !Number.isInteger(Number(maxTokens)) || (extractionMode === "prompt" ? !prompt.trim() : !fieldsValid)))) {
       setSaveError("Проверьте название, настройки OCR и извлечения. Названия полей должны быть уникальными."); return;
     }
-    try { const saved = savePipeline({ ...pipeline, ...(savedId ? { id: savedId } : {}) }); setSavedId(saved.id); setCreated(true); }
+    savingRef.current = true;
+    setSaving(true);
+    try { const saved = await savePipeline({ ...pipeline, ...(savedId ? { id: savedId } : {}) }); setSavedId(saved.id); setCreated(true); }
     catch (error) { setSaveError(error.message); }
+    finally { savingRef.current = false; setSaving(false); }
   };
   const next = () => { if (!isValid) return; if (step === 3 && skipExtraction) finish(); else if (step < 4) setStep(step + 1); else finish(); };
   const addField = () => setFields([...fields, { id: Date.now(), name: "", description: "" }]);
@@ -115,7 +121,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
         {step === 2 && <StepSource sourceType={sourceType} setSourceType={(value) => { setSourceType(value); setSkipExtraction(false); }}/>}
         {step === 3 && <StepOcr temperature={ocrTemperature} setTemperature={setOcrTemperature} sourceType={sourceType} ocrMode={ocrMode} setOcrMode={(value) => { setOcrMode(value); setSkipExtraction(false); }} ocrModel={ocrModel} setOcrModel={setOcrModel} ocrServiceUrl={ocrServiceUrl} setOcrServiceUrl={setOcrServiceUrl} visionPrompt={visionPrompt} setVisionPrompt={setVisionPrompt} skipExtraction={skipExtraction} setSkipExtraction={setSkipExtraction} models={models} modelsLoading={modelsLoading} modelError={modelError}/>}
         {step === 4 && <StepExtraction temperature={extractionTemperature} setTemperature={setExtractionTemperature} extractionMode={extractionMode} setExtractionMode={setExtractionMode} prompt={prompt} setPrompt={setPrompt} fields={fields} setFields={setFields} addField={addField} llmModel={llmModel} setLlmModel={setLlmModel} maxTokens={maxTokens} setMaxTokens={setMaxTokens} models={models} modelsLoading={modelsLoading} modelError={modelError}/>}
-        {saveError && <p className="history-error" role="alert">{saveError}</p>}<div className="question-actions"><Button variant="ghost" onClick={() => setStep(Math.max(1, step - 1))} disabled={step === 1}><ArrowLeft size={16}/>Назад</Button><div>{!isValid && <span className="validation-hint">Заполните обязательные поля</span>}{initialPipeline && step < 4 && !(step === 3 && skipExtraction) && <Button variant="outline" onClick={finish}>Сохранить изменения</Button>}<Button onClick={next} disabled={!isValid}>{step === 4 || (step === 3 && skipExtraction) ? (savedId ? "Сохранить изменения" : "Создать пайплайн") : "Продолжить"}{step < 4 && !(step === 3 && skipExtraction) && <ArrowRight size={16}/>}</Button></div></div>
+        {saveError && <p className="history-error" role="alert">{saveError}</p>}<div className="question-actions"><Button variant="ghost" onClick={() => setStep(Math.max(1, step - 1))} disabled={saving || step === 1}><ArrowLeft size={16}/>Назад</Button><div>{!isValid && <span className="validation-hint">Заполните обязательные поля</span>}{initialPipeline && step < 4 && !(step === 3 && skipExtraction) && <Button variant="outline" onClick={finish} disabled={saving}>Сохранить изменения</Button>}<Button onClick={next} disabled={saving || !isValid}>{step === 4 || (step === 3 && skipExtraction) ? (savedId ? "Сохранить изменения" : "Создать пайплайн") : "Продолжить"}{step < 4 && !(step === 3 && skipExtraction) && <ArrowRight size={16}/>}</Button></div></div>
       </div></section>
 
       <aside className="summary-panel"><div className="summary-head"><span>КОНФИГУРАЦИЯ</span><strong>{name.trim() || "Без названия"}</strong></div><SummaryRow number="01" label="Источник" value={sourceType === "scans" ? "Сканы и изображения" : "Цифровой документ"}/><SummaryRow number="02" label="Получение текста" value={sourceType !== "scans" ? "Прямое извлечение" : ocrMode === "litellm" ? (ocrModel || "Модель не выбрана") : (ocrServiceUrl || "Сервис не указан")}/><SummaryRow number="03" label="Извлечение данных" value={skipExtraction ? "Отключено — ответ Vision финальный" : extractionMode === "prompt" ? "Свободный промпт" : `${fields.length} параметра`}/><SummaryRow number="04" label="LLM" value={skipExtraction ? "Не используется" : llmModel || "Модель не выбрана"}/><div className="token-summary"><span>{skipExtraction ? "Финальный результат" : "Лимит ответа"}</span><strong>{skipExtraction ? "Ответ Vision-модели" : `${Number(maxTokens).toLocaleString("ru-RU")} tokens`}</strong></div></aside>

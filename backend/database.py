@@ -27,6 +27,17 @@ class Document(Base):
     revision: Mapped[int] = mapped_column(Integer, default=0)
 
 
+
+class SavedPipeline(Base):
+    __tablename__ = "pipelines"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    config: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[str] = mapped_column(String(32))
+    deleted: Mapped[int] = mapped_column(Integer, default=0)
+
+
 def open_database(database_url: str):
     url = make_url(database_url)
     if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":

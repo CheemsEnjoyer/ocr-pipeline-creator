@@ -12,7 +12,7 @@ import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, A
 const date = (value) => value ? new Date(value).toLocaleString("ru-RU", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 
 export default function PipelinesPage() {
-  const { pipelines, ready } = usePipelines();
+  const { pipelines, ready, error: loadError } = usePipelines();
   const [removing, setRemoving] = useState(null);
   const [error, setError] = useState("");
 
@@ -24,9 +24,10 @@ export default function PipelinesPage() {
         <Button asChild><Link href="/createpipeline"><Plus size={17}/>Создать пайплайн</Link></Button>
       </div>
 
+      {loadError && <p className="history-error" role="alert">{loadError}</p>}
       {!ready && <p className="history-loading" role="status">Загружаем пайплайны…</p>}
 
-      {ready && !pipelines.length && <div className="history-empty">
+      {ready && !loadError && !pipelines.length && <div className="history-empty">
         <Workflow size={38}/>
         <strong>Пайплайнов пока нет</strong>
         <p>Соберите первый сценарий в конструкторе — он появится здесь и станет доступен на странице обработки.</p>
@@ -53,6 +54,6 @@ export default function PipelinesPage() {
       })}</div>}
     </div>
 
-    <AlertDialog open={Boolean(removing)} onOpenChange={(open) => { if (!open) setRemoving(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Удалить пайплайн?</AlertDialogTitle><AlertDialogDescription>«{removing?.name}» будет удалён из списка. Обработанные документы и их история сохранятся.</AlertDialogDescription></AlertDialogHeader>{error && <p className="history-error" role="alert">{error}</p>}<AlertDialogFooter><AlertDialogCancel>Отмена</AlertDialogCancel><Button variant="destructive" onClick={() => { try { deletePipeline(removing.id); setRemoving(null); } catch (error) { setError(error.message); } }}>Удалить</Button></AlertDialogFooter></AlertDialogContent></AlertDialog>
+    <AlertDialog open={Boolean(removing)} onOpenChange={(open) => { if (!open) setRemoving(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Удалить пайплайн?</AlertDialogTitle><AlertDialogDescription>«{removing?.name}» будет удалён из списка. Обработанные документы и их история сохранятся.</AlertDialogDescription></AlertDialogHeader>{error && <p className="history-error" role="alert">{error}</p>}<AlertDialogFooter><AlertDialogCancel>Отмена</AlertDialogCancel><Button variant="destructive" onClick={async () => { try { await deletePipeline(removing.id); setRemoving(null); } catch (error) { setError(error.message); } }}>Удалить</Button></AlertDialogFooter></AlertDialogContent></AlertDialog>
   </main>;
 }

@@ -18,7 +18,7 @@ function formatSize(bytes) {
 }
 
 export default function ProcessPage() {
-  const { pipelines } = usePipelines();
+  const { pipelines, ready, error: pipelineError } = usePipelines();
   const [pipelineId, setPipelineId] = useState("");
   const [items, setItems] = useState([]);
   const [dragging, setDragging] = useState(false);
@@ -91,7 +91,7 @@ export default function ProcessPage() {
       <aside className="pipeline-column">
         <div className="section-head"><p className="eyebrow">ШАГ 2</p><h2>Выберите пайплайн</h2></div>
 
-        {pipelines.length === 0 ? <div className="empty-pipelines">
+        {pipelineError ? <p className="history-error" role="alert">{pipelineError}</p> : !ready ? <p role="status">Загружаем пайплайны…</p> : pipelines.length === 0 ? <div className="empty-pipelines">
           <Workflow size={22}/>
           <strong>Пайплайнов пока нет</strong>
           <span>Соберите первый пайплайн в конструкторе — он появится здесь.</span>

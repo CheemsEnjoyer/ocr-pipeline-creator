@@ -17,7 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from .database import Base, Document, open_database
+from .database import Base, Document, SavedPipeline, open_database
 from .processing import Pipeline, api_url, complete, extract, litellm_config, proxy_options, recognize, result_fields
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +40,15 @@ def serialize(document, detail=False):
 class FieldUpdate(BaseModel):
     fields: dict
     revision: int = Field(ge=0, strict=True)
+
+
+
+class PipelineImport(Pipeline):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
+
+
+def serialize_pipeline(row):
+    return {**row.config, "id": row.id, "createdAt": row.created_at, "updatedAt": row.updated_at}
 
 
 class ChatRequest(BaseModel):
@@ -116,6 +125,55 @@ def create_app(database_url=None, data_dir=None, transport=None):
             session.execute(select(1))
         # Адреса из .env видны в health, чтобы не гадать, что именно прочитал сервер. Ключ не отдаём.
         return {"status": "ok", "backend": "fastapi-sqlalchemy", "proxy": app.state.proxy, "litellm": os.getenv("LITELLM_BASE_URL", "").strip() or None}
+
+    @app.get("/api/pipelines")
+    def list_pipelines():
+        with app.state.sessions() as session:
+            rows = session.scalars(select(SavedPipeline).where(SavedPipeline.deleted == 0).order_by(SavedPipeline.updated_at.desc(), SavedPipeline.id))
+            return {"pipelines": [serialize_pipeline(row) for row in rows]}
+
+    @app.post("/api/pipelines", status_code=201)
+    def create_pipeline(payload: Pipeline):
+        timestamp = now()
+        with app.state.sessions() as session:
+            row = SavedPipeline(id=f"pl_{uuid4()}", config=payload.model_dump(mode="json"), created_at=timestamp, updated_at=timestamp)
+            session.add(row)
+            session.commit()
+            return {"pipeline": serialize_pipeline(row)}
+
+    @app.post("/api/pipelines/import")
+    def import_pipelines(payload: list[PipelineImport]):
+        # Import legacy browser configurations only once; never overwrite server edits
+        # or resurrect a pipeline deleted from another browser.
+        timestamp = now()
+        with app.state.sessions() as session:
+            for item in payload:
+                if session.get(SavedPipeline, item.id) is None:
+                    session.add(SavedPipeline(id=item.id, config=item.model_dump(mode="json", exclude={"id"}), created_at=timestamp, updated_at=timestamp))
+                    session.flush()
+            session.commit()
+        return {"status": "ok"}
+
+    @app.patch("/api/pipelines/{pipeline_id}")
+    def update_pipeline(pipeline_id: str, payload: Pipeline):
+        with app.state.sessions() as session:
+            row = session.get(SavedPipeline, pipeline_id)
+            if row is None or row.deleted:
+                raise HTTPException(404, "Пайплайн не найден")
+            row.config = payload.model_dump(mode="json")
+            row.updated_at = now()
+            session.commit()
+            return {"pipeline": serialize_pipeline(row)}
+
+    @app.delete("/api/pipelines/{pipeline_id}")
+    def remove_pipeline(pipeline_id: str):
+        with app.state.sessions() as session:
+            row = session.get(SavedPipeline, pipeline_id)
+            if row is None or row.deleted:
+                raise HTTPException(404, "Пайплайн не найден")
+            row.deleted = 1
+            session.commit()
+        return {"status": "ok"}
 
     @app.get("/api/documents")
     def documents(page: int = Query(default=0, ge=0)):

@@ -51,6 +51,38 @@ class APITests(unittest.TestCase):
     def upload(self, content=b'{"total": 1250}', filename="test.json", mime="application/json", pipeline=None):
         return self.client.post("/api/pipeline/run", files={"file": (filename, content, mime)}, data={"pipeline": json.dumps(pipeline or {"source": "document", "name": "Тест"})})
 
+    def test_pipeline_catalog_and_run(self):
+        self.assertEqual(self.client.get("/api/pipelines").json(), {"pipelines": []})
+        config = {"name": "Catalog test", "source": "scans", "ocr": {"provider": "litellm", "model": "vision", "temperature": 0.4}, "extraction": {"mode": "prompt", "model": "extract", "prompt": "JSON", "temperature": 0.7, "max_tokens": 512}}
+        created = self.client.post("/api/pipelines", json=config)
+        self.assertEqual(created.status_code, 201, created.text)
+        pipeline = created.json()["pipeline"]
+        self.assertTrue(pipeline["id"].startswith("pl_"))
+        listed = self.client.get("/api/pipelines").json()["pipelines"]
+        self.assertEqual(listed, [pipeline])
+        self.assertEqual(self.upload(b"image", "scan.png", "image/png", listed[0]).status_code, 200)
+        with TestClient(self.make_app()) as restarted:
+            self.assertEqual(restarted.get("/api/pipelines").json()["pipelines"], listed)
+        changed = {**pipeline, "name": "Updated"}
+        self.assertEqual(self.client.patch(f"/api/pipelines/{pipeline['id']}", json=changed).status_code, 200)
+        self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"][0]["name"], "Updated")
+        self.assertEqual(self.client.delete(f"/api/pipelines/{pipeline['id']}").status_code, 200)
+        self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"], [])
+
+    def test_pipeline_import_preserves_edits_and_deletions(self):
+        legacy = {"id": "pl_legacy", "name": "Legacy", "source": "document", "extraction": None}
+        for _ in range(2):
+            self.assertEqual(self.client.post("/api/pipelines/import", json=[legacy]).status_code, 200)
+        self.assertEqual(len(self.client.get("/api/pipelines").json()["pipelines"]), 1)
+        self.client.patch("/api/pipelines/pl_legacy", json={**legacy, "name": "Server edit"})
+        self.client.post("/api/pipelines/import", json=[legacy])
+        self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"][0]["name"], "Server edit")
+        self.client.delete("/api/pipelines/pl_legacy")
+        self.client.post("/api/pipelines/import", json=[legacy])
+        self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"], [])
+        self.assertEqual(self.client.patch("/api/pipelines/missing", json=legacy).status_code, 404)
+        self.assertEqual(self.client.post("/api/pipelines", json={"source": "invalid"}).status_code, 422)
+
     def test_create_history_edit_original_and_restart(self):
         with self.app.state.sessions() as session:
             self.assertIn("documents", inspect(session.bind).get_table_names())
