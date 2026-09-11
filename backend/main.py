@@ -73,7 +73,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             # Idempotent: existing tables and documents are preserved on every restart.
             Base.metadata.create_all(engine)
             app.state.sessions = sessions
-            app.state.admin_hash = initialize_admin(storage)
+            initialize_admin(app, storage)
             # PROXY_URL (or HTTP(S)_PROXY) is applied to the environment before the client is built,
             # so httpx sends the external OCR service and LiteLLM traffic through it.
             app.state.proxy = proxy_options()

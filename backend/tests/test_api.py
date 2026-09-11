@@ -3,6 +3,8 @@ import json
 import os
 import tempfile
 import unittest
+from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,12 +12,14 @@ import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select, update
 
+from backend.access import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
 from backend.database import AdminSession, APIKey
 from backend.main import MAX_FILE_SIZE, create_app
 from backend.processing import proxy_options
 
-ADMIN_KEY = "test-admin-" + "k" * 40
-ADMIN = {"Authorization": f"Bearer {ADMIN_KEY}"}
+ADMIN_LOGIN = "admin"
+ADMIN_PASSWORD = "test-password-123"
+ADMIN_CREDENTIALS = {"login": ADMIN_LOGIN, "password": ADMIN_PASSWORD}
 
 
 class APITests(unittest.TestCase):
@@ -27,13 +31,14 @@ class APITests(unittest.TestCase):
         self.calls = []
         self.fail_upstream = False
         self.refuse_upstream = False
-        self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_KEY": ADMIN_KEY})
+        self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_LOGIN": ADMIN_LOGIN, "OCR_ADMIN_PASSWORD": ADMIN_PASSWORD})
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.app = self.make_app()
-        self.client = TestClient(self.app, headers=ADMIN)
+        self.client = TestClient(self.app)
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)
+        self.sign_in(self.client)
 
     def upstream(self, request):
         self.calls.append(request)
@@ -52,6 +57,17 @@ class APITests(unittest.TestCase):
     def make_app(self):
         return create_app(self.database_url, self.storage, httpx.MockTransport(self.upstream))
 
+    def sign_in(self, client):
+        response = client.post("/api/auth/login", json=ADMIN_CREDENTIALS)
+        self.assertEqual(response.status_code, 200, response.text)
+        return client
+
+    @contextmanager
+    def restarted_app(self):
+        # Новый жизненный цикл приложения на той же базе, с новым входом администратора.
+        with TestClient(self.make_app()) as client:
+            yield self.sign_in(client)
+
     def upload(self, content=b'{"total": 1250}', filename="test.json", mime="application/json", pipeline=None):
         return self.client.post("/api/pipeline/run", files={"file": (filename, content, mime)}, data={"pipeline": json.dumps(pipeline or {"source": "document", "name": "Тест"})})
 
@@ -65,7 +81,7 @@ class APITests(unittest.TestCase):
         listed = self.client.get("/api/pipelines").json()["pipelines"]
         self.assertEqual(listed, [pipeline])
         self.assertEqual(self.upload(b"image", "scan.png", "image/png", listed[0]).status_code, 200)
-        with TestClient(self.make_app(), headers=ADMIN) as restarted:
+        with self.restarted_app() as restarted:
             self.assertEqual(restarted.get("/api/pipelines").json()["pipelines"], listed)
         changed = {**pipeline, "name": "Updated"}
         self.assertEqual(self.client.patch(f"/api/pipelines/{pipeline['id']}", json=changed).status_code, 200)
@@ -103,7 +119,7 @@ class APITests(unittest.TestCase):
         conflict = self.client.patch(f"/api/documents/{document_id}", json={"fields": {}, "revision": 0})
         self.assertEqual(conflict.status_code, 409)
         # A second application lifespan reuses the same SQLite file without SQL commands.
-        with TestClient(self.make_app(), headers=ADMIN) as restarted:
+        with self.restarted_app() as restarted:
             after = restarted.get(f"/api/documents/{document_id}").json()["document"]
             self.assertEqual(after["fields"], {"total": 1500, "lines": [1, 2]})
             self.assertEqual(after["text"], before["text"])
@@ -168,7 +184,7 @@ class APITests(unittest.TestCase):
         blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), "")
         with patch.dict("os.environ", {**blank, "PROXY_URL": "proxy.company.local:8080"}):
             app = self.make_app()
-            with TestClient(app, headers=ADMIN):
+            with TestClient(app):
                 self.assertEqual(app.state.proxy, "http://proxy.company.local:8080")
 
     def create_pipeline(self, name):
@@ -186,48 +202,78 @@ class APITests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(getattr(anonymous, method)(url).status_code, 401)
         self.assertEqual(self.send_document(anonymous, "/api/pipeline/run", {"pipeline": json.dumps({"source": "document"})}).status_code, 401)
-        for header in ("Bearer wrong-key", "Basic dXNlcjpwYXNz", "Bearer " + "x" * 600):
+        # Пароль администратора в заголовке не работает — там принимаются только ключи интеграций.
+        for header in ("Bearer wrong-key", "Bearer " + ADMIN_PASSWORD, "Basic dXNlcjpwYXNz", "Bearer " + "x" * 600):
             with self.subTest(header=header[:20]):
                 self.assertEqual(anonymous.get("/api/pipelines", headers={"Authorization": header}).status_code, 401)
 
     def test_admin_login_session_expiry_and_logout(self):
         browser = TestClient(self.app)
-        self.assertEqual(browser.post("/api/auth/login", json={"key": "x" * 40}).status_code, 401)
-        login = browser.post("/api/auth/login", json={"key": ADMIN_KEY})
+        for credentials in ({"login": ADMIN_LOGIN, "password": "wrong-password"}, {"login": "root", "password": ADMIN_PASSWORD}):
+            with self.subTest(login=credentials["login"]):
+                wrong = browser.post("/api/auth/login", json=credentials)
+                # Одинаковый ответ: по нему не понять, что именно неверно.
+                self.assertEqual((wrong.status_code, wrong.json()["error"]), (401, "Неверный логин или пароль"))
+        login = browser.post("/api/auth/login", json={"login": f"  {ADMIN_LOGIN} ", "password": ADMIN_PASSWORD})
         self.assertEqual(login.status_code, 200, login.text)
         cookie = login.headers["set-cookie"].lower()
         self.assertIn("httponly", cookie)
         self.assertIn("samesite=strict", cookie)
         token = browser.cookies.get("ocr_admin_session")
         with self.app.state.sessions() as session:
-            # В базе лежит только хэш сессии.
-            self.assertNotIn(token, session.scalars(select(AdminSession.token_hash)).all())
+            rows = session.scalars(select(AdminSession)).all()
+            # В базе нет ни токена сессии, ни пароля в открытом виде.
+            self.assertNotIn(token, [row.token_hash for row in rows])
+            self.assertFalse(any(ADMIN_PASSWORD in row.admin_hash for row in rows))
         self.assertEqual(browser.get("/api/auth/session").json(), {"role": "admin"})
         self.assertEqual(browser.get("/api/documents").status_code, 200)
         with self.app.state.sessions.begin() as session:
             session.execute(update(AdminSession).values(expires_at=0))
         self.assertEqual(browser.get("/api/auth/session").status_code, 401)
 
-        browser.post("/api/auth/login", json={"key": ADMIN_KEY})
+        self.sign_in(browser)
         token = browser.cookies.get("ocr_admin_session")
         self.assertEqual(browser.post("/api/auth/logout").status_code, 200)
         # Старый cookie не оживает, даже если клиент пришлёт его снова.
         self.assertEqual(TestClient(self.app, cookies={"ocr_admin_session": token}).get("/api/auth/session").status_code, 401)
 
-    def test_admin_key_is_generated_once_when_not_configured(self):
+    def test_admin_password_is_generated_once_when_not_configured(self):
         storage = self.storage / "fresh"
         database = f"sqlite:///{(storage / 'fresh.sqlite3').as_posix()}"
-        with patch.dict("os.environ", {"OCR_ADMIN_KEY": ""}):
+        with patch.dict("os.environ", {"OCR_ADMIN_LOGIN": "", "OCR_ADMIN_PASSWORD": ""}):
             with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as first:
-                key = (storage / "admin-api-key.txt").read_text(encoding="utf-8").strip()
-                self.assertTrue(key.startswith("ocr_admin_"))
-                self.assertEqual(first.post("/api/auth/login", json={"key": key}).status_code, 200)
+                password = (storage / "admin-password.txt").read_text(encoding="utf-8").strip()
+                self.assertGreaterEqual(len(password), 16)
+                self.assertEqual(first.post("/api/auth/login", json={"login": "admin", "password": password}).status_code, 200)
             with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as second:
-                self.assertEqual(second.get("/api/auth/session", headers={"Authorization": f"Bearer {key}"}).status_code, 200)
-            self.assertEqual((storage / "admin-api-key.txt").read_text(encoding="utf-8").strip(), key)
-        with patch.dict("os.environ", {"OCR_ADMIN_KEY": "short"}), self.assertRaisesRegex(RuntimeError, "OCR_ADMIN_KEY"):
+                self.assertEqual(second.post("/api/auth/login", json={"login": "admin", "password": password}).status_code, 200)
+            self.assertEqual((storage / "admin-password.txt").read_text(encoding="utf-8").strip(), password)
+        with patch.dict("os.environ", {"OCR_ADMIN_PASSWORD": "short"}), self.assertRaisesRegex(RuntimeError, "OCR_ADMIN_PASSWORD"):
             with TestClient(self.make_app()):
                 pass
+
+    def test_changing_admin_password_ends_sessions(self):
+        token = self.client.cookies.get("ocr_admin_session")
+        with TestClient(self.make_app(), cookies={"ocr_admin_session": token}) as same_password:
+            self.assertEqual(same_password.get("/api/auth/session").status_code, 200)
+        with patch.dict("os.environ", {"OCR_ADMIN_PASSWORD": "another-password-456"}), TestClient(self.make_app(), cookies={"ocr_admin_session": token}) as changed:
+            self.assertEqual(changed.get("/api/auth/session").status_code, 401)
+            self.assertEqual(changed.post("/api/auth/login", json=ADMIN_CREDENTIALS).status_code, 401)
+            self.assertEqual(changed.post("/api/auth/login", json={"login": ADMIN_LOGIN, "password": "another-password-456"}).status_code, 200)
+
+    def test_repeated_failed_logins_are_throttled(self):
+        browser = TestClient(self.app)
+        wrong = {"login": ADMIN_LOGIN, "password": "wrong-password"}
+        for _ in range(MAX_FAILED_LOGINS):
+            self.assertEqual(browser.post("/api/auth/login", json=wrong).status_code, 401)
+        locked = browser.post("/api/auth/login", json=ADMIN_CREDENTIALS)
+        self.assertEqual(locked.status_code, 429)
+        self.assertIn("Повторите через 10 мин", locked.json()["error"])
+        # Окно прошло — верный пароль снова работает, а счётчик сбрасывается.
+        throttle = self.app.state.login_throttle
+        throttle.failures = deque(moment - FAILED_LOGIN_WINDOW for moment in throttle.failures)
+        self.assertEqual(browser.post("/api/auth/login", json=ADMIN_CREDENTIALS).status_code, 200)
+        self.assertEqual(len(throttle.failures), 0)
 
     def test_integration_key_is_limited_to_assigned_pipelines(self):
         allowed = self.create_pipeline("Счета")
@@ -255,7 +301,7 @@ class APITests(unittest.TestCase):
         for method, url in (("get", "/api/documents"), ("get", "/api/keys"), ("post", "/api/keys"), ("get", "/api/auth/session"), ("post", "/api/pipelines"), ("delete", f"/api/pipelines/{allowed}"), ("get", "/api/litellm/models")):
             with self.subTest(method=method, url=url):
                 self.assertEqual(getattr(integration, method)(url).status_code, 403)
-        self.assertEqual(TestClient(self.app).post("/api/auth/login", json={"key": token}).status_code, 401)
+        self.assertEqual(TestClient(self.app).post("/api/auth/login", json={"login": ADMIN_LOGIN, "password": token}).status_code, 401)
 
     def test_key_access_can_be_changed_and_revoked(self):
         first = self.create_pipeline("Первый")

@@ -1,9 +1,12 @@
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
+import threading
 import time
+from collections import deque
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response, Security
@@ -13,9 +16,14 @@ from sqlalchemy import delete, select
 
 from .database import APIKey, AdminSession, SavedPipeline
 
-bearer = HTTPBearer(auto_error=False, scheme_name="API key", description="Ключ администратора или ключ интеграции")
+bearer = HTTPBearer(auto_error=False, scheme_name="API key", description="Ключ интеграции")
 COOKIE = "ocr_admin_session"
 SESSION_SECONDS = 12 * 60 * 60
+PASSWORD_FILE = "admin-password.txt"
+MIN_PASSWORD_LENGTH = 8
+# Пароль, в отличие от ключа, бывает коротким, поэтому перебор ограничен.
+MAX_FAILED_LOGINS = 10
+FAILED_LOGIN_WINDOW = 10 * 60
 router = APIRouter()
 
 
@@ -23,24 +31,44 @@ def digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def initialize_admin(storage):
-    token = os.getenv("OCR_ADMIN_KEY", "").strip()
-    if not token:
-        path = storage / "admin-api-key.txt"
+def fingerprint(login, password):
+    # Медленный хэш: по отпечатку в таблице сессий пароль быстро не подобрать.
+    return hashlib.scrypt(f"{login}\0{password}".encode("utf-8"), salt=b"ocr-flow-admin", n=2**14, r=8, p=1, dklen=32).hex()
+
+
+class LoginThrottle:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.failures = deque()
+
+    def retry_after(self, moment):
+        while self.failures and moment - self.failures[0] >= FAILED_LOGIN_WINDOW:
+            self.failures.popleft()
+        return FAILED_LOGIN_WINDOW - (moment - self.failures[0]) if len(self.failures) >= MAX_FAILED_LOGINS else 0
+
+
+def initialize_admin(app, storage):
+    login = os.getenv("OCR_ADMIN_LOGIN", "").strip() or "admin"
+    password = os.getenv("OCR_ADMIN_PASSWORD", "")
+    source = "OCR_ADMIN_PASSWORD"
+    if not password:
+        path = storage / PASSWORD_FILE
+        source = f"Файл {path}"
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            token = path.read_text(encoding="utf-8").strip()
+            password = path.read_text(encoding="utf-8").strip()
         else:
-            token = "ocr_admin_" + secrets.token_urlsafe(32)
+            password = secrets.token_urlsafe(18)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                stream.write(token + chr(10))
-        logging.getLogger("uvicorn.error").info("Ключ входа администратора хранится в %s", path)
-    if len(token) < 32:
-        # Короткий ключ может прийти и из повреждённого файла — называем реальный источник.
-        source = "OCR_ADMIN_KEY" if os.getenv("OCR_ADMIN_KEY", "").strip() else f"Файл {storage / 'admin-api-key.txt'}"
-        raise RuntimeError(f"{source}: ключ администратора должен содержать не менее 32 символов")
-    return digest(token)
+                stream.write(password + chr(10))
+        logging.getLogger("uvicorn.error").info("Вход администратора: логин %s, пароль хранится в %s", login, path)
+    if len(login) > 120:
+        raise RuntimeError("OCR_ADMIN_LOGIN: логин должен быть не длиннее 120 символов")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise RuntimeError(f"{source}: пароль администратора должен содержать не менее {MIN_PASSWORD_LENGTH} символов")
+    app.state.admin_fingerprint = fingerprint(login, password)
+    app.state.login_throttle = LoginThrottle()
 
 
 def require_access(request: Request, credentials: HTTPAuthorizationCredentials | None = Security(bearer)):
@@ -51,14 +79,11 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
     request.state.pipeline_ids = []
     authorization = request.headers.get("authorization")
     if authorization is not None:
+        # В заголовке принимаются только ключи интеграций; администратор входит через сессию.
         if credentials is None or len(credentials.credentials) > 512:
             raise HTTPException(401, "Некорректный API-ключ")
-        token_hash = digest(credentials.credentials)
-        if secrets.compare_digest(token_hash, request.app.state.admin_hash):
-            request.state.is_admin = True
-            return
         with request.app.state.sessions() as session:
-            key = session.scalar(select(APIKey).where(APIKey.token_hash == token_hash, APIKey.revoked_at.is_(None)))
+            key = session.scalar(select(APIKey).where(APIKey.token_hash == digest(credentials.credentials), APIKey.revoked_at.is_(None)))
             if key is None:
                 raise HTTPException(401, "API-ключ недействителен или отозван")
             request.state.pipeline_ids = list(key.pipeline_ids)
@@ -72,14 +97,16 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
     if cookie and len(cookie) <= 512:
         with request.app.state.sessions() as session:
             row = session.get(AdminSession, digest(cookie))
-            if row and row.expires_at > int(time.time()) and secrets.compare_digest(row.admin_hash, request.app.state.admin_hash):
+            # admin_hash хранит отпечаток логина и пароля: их смена завершает все сессии.
+            if row and row.expires_at > int(time.time()) and secrets.compare_digest(row.admin_hash, request.app.state.admin_fingerprint):
                 request.state.is_admin = True
                 return
     raise HTTPException(401, "Требуется вход администратора или API-ключ")
 
 
 class Login(BaseModel):
-    key: str = Field(min_length=1, max_length=512)
+    login: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class KeySettings(BaseModel):
@@ -104,15 +131,24 @@ def validate_settings(session, payload):
 
 @router.post("/api/auth/login")
 def login(payload: Login, request: Request, response: Response):
-    if not secrets.compare_digest(digest(payload.key), request.app.state.admin_hash):
-        raise HTTPException(401, "Неверный ключ администратора")
+    throttle = request.app.state.login_throttle
+    # Проверки идут по одной: счётчик точен, а параллельные scrypt не съедают память.
+    with throttle.lock:
+        moment = time.monotonic()
+        retry = throttle.retry_after(moment)
+        if retry:
+            raise HTTPException(429, f"Слишком много неудачных попыток входа. Повторите через {math.ceil(retry / 60)} мин.")
+        if not secrets.compare_digest(fingerprint(payload.login.strip(), payload.password), request.app.state.admin_fingerprint):
+            throttle.failures.append(moment)
+            raise HTTPException(401, "Неверный логин или пароль")
+        throttle.failures.clear()
     token = secrets.token_urlsafe(32)
     with request.app.state.sessions.begin() as session:
         session.execute(delete(AdminSession).where(AdminSession.expires_at <= int(time.time())))
         previous = request.cookies.get(COOKIE)
         if previous:
             session.execute(delete(AdminSession).where(AdminSession.token_hash == digest(previous)))
-        session.add(AdminSession(token_hash=digest(token), admin_hash=request.app.state.admin_hash, expires_at=int(time.time()) + SESSION_SECONDS))
+        session.add(AdminSession(token_hash=digest(token), admin_hash=request.app.state.admin_fingerprint, expires_at=int(time.time()) + SESSION_SECONDS))
     response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True, samesite="strict", secure=os.getenv("OCR_SECURE_COOKIE") == "1", path="/")
     return {"status": "ok"}
 
