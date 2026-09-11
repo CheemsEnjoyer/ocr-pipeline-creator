@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { History, Layers, ScanText, Workflow } from "lucide-react";
+import { History, KeyRound, Layers, ScanText, Workflow } from "lucide-react";
 import { Sidebar, SidebarContent, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarMenuButton, SidebarProvider, useSidebar } from "@/components/ui/sidebar";
 
 const links = [
@@ -10,6 +10,7 @@ const links = [
   { href: "/createpipeline", label: "Конструктор", icon: Workflow, match: (pathname) => pathname === "/createpipeline" },
   { href: "/pipelines", label: "Пайплайны", icon: Layers, match: (pathname) => pathname === "/pipelines" || pathname.startsWith("/pipelines/") },
   { href: "/history", label: "История документов", icon: History, match: (pathname) => pathname === "/history" },
+  { href: "/api-keys", label: "API-ключи", icon: KeyRound, match: (pathname) => pathname === "/api-keys" },
 ];
 
 function Navigation() {
@@ -30,5 +31,7 @@ function Navigation() {
 }
 
 export default function AppNavigation({ children }) {
+  const pathname = usePathname();
+  if (pathname === "/login") return children;
   return <SidebarProvider style={{ "--sidebar-width": "230px" }}><Navigation/><div className="workspace-content">{children}</div></SidebarProvider>;
 }

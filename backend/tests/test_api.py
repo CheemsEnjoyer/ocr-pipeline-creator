@@ -8,10 +8,14 @@ from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select, update
 
+from backend.database import AdminSession, APIKey
 from backend.main import MAX_FILE_SIZE, create_app
 from backend.processing import proxy_options
+
+ADMIN_KEY = "test-admin-" + "k" * 40
+ADMIN = {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
 class APITests(unittest.TestCase):
@@ -23,11 +27,11 @@ class APITests(unittest.TestCase):
         self.calls = []
         self.fail_upstream = False
         self.refuse_upstream = False
-        self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key"})
+        self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_KEY": ADMIN_KEY})
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.app = self.make_app()
-        self.client = TestClient(self.app)
+        self.client = TestClient(self.app, headers=ADMIN)
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)
 
@@ -61,7 +65,7 @@ class APITests(unittest.TestCase):
         listed = self.client.get("/api/pipelines").json()["pipelines"]
         self.assertEqual(listed, [pipeline])
         self.assertEqual(self.upload(b"image", "scan.png", "image/png", listed[0]).status_code, 200)
-        with TestClient(self.make_app()) as restarted:
+        with TestClient(self.make_app(), headers=ADMIN) as restarted:
             self.assertEqual(restarted.get("/api/pipelines").json()["pipelines"], listed)
         changed = {**pipeline, "name": "Updated"}
         self.assertEqual(self.client.patch(f"/api/pipelines/{pipeline['id']}", json=changed).status_code, 200)
@@ -99,7 +103,7 @@ class APITests(unittest.TestCase):
         conflict = self.client.patch(f"/api/documents/{document_id}", json={"fields": {}, "revision": 0})
         self.assertEqual(conflict.status_code, 409)
         # A second application lifespan reuses the same SQLite file without SQL commands.
-        with TestClient(self.make_app()) as restarted:
+        with TestClient(self.make_app(), headers=ADMIN) as restarted:
             after = restarted.get(f"/api/documents/{document_id}").json()["document"]
             self.assertEqual(after["fields"], {"total": 1500, "lines": [1, 2]})
             self.assertEqual(after["text"], before["text"])
@@ -156,15 +160,134 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
         self.assertEqual(len(list((self.storage / "originals").iterdir())), 1)
 
-    def test_health_reports_the_configured_proxy(self):
+    def test_health_is_public_and_hides_configuration(self):
+        # health открыт без входа, поэтому адреса LiteLLM и прокси в нём не раскрываются.
+        health = TestClient(self.app).get("/api/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json(), {"status": "ok", "backend": "fastapi-sqlalchemy"})
         blank = dict.fromkeys(("PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), "")
-        with patch.dict("os.environ", blank), TestClient(self.make_app()) as plain:
-            self.assertIsNone(plain.get("/api/health").json()["proxy"])
-        with patch.dict("os.environ", {**blank, "PROXY_URL": "proxy.company.local:8080"}), TestClient(self.make_app()) as proxied:
-            self.assertEqual(proxied.get("/api/health").json()["proxy"], "http://proxy.company.local:8080")
-        health = self.client.get("/api/health").json()
-        self.assertEqual(health["litellm"], "http://litellm.test/v1")
-        self.assertNotIn("test-key", json.dumps(health))
+        with patch.dict("os.environ", {**blank, "PROXY_URL": "proxy.company.local:8080"}):
+            app = self.make_app()
+            with TestClient(app, headers=ADMIN):
+                self.assertEqual(app.state.proxy, "http://proxy.company.local:8080")
+
+    def create_pipeline(self, name):
+        response = self.client.post("/api/pipelines", json={"name": name, "source": "document", "extraction": None})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["pipeline"]["id"]
+
+    @staticmethod
+    def send_document(client, url, data=None):
+        return client.post(url, files={"file": ("doc.txt", "Текст документа".encode(), "text/plain")}, data=data or {})
+
+    def test_requests_without_credentials_are_rejected(self):
+        anonymous = TestClient(self.app)
+        for method, url in (("get", "/api/pipelines"), ("get", "/api/documents"), ("get", "/api/keys"), ("get", "/api/auth/session"), ("get", "/api/litellm/models")):
+            with self.subTest(url=url):
+                self.assertEqual(getattr(anonymous, method)(url).status_code, 401)
+        self.assertEqual(self.send_document(anonymous, "/api/pipeline/run", {"pipeline": json.dumps({"source": "document"})}).status_code, 401)
+        for header in ("Bearer wrong-key", "Basic dXNlcjpwYXNz", "Bearer " + "x" * 600):
+            with self.subTest(header=header[:20]):
+                self.assertEqual(anonymous.get("/api/pipelines", headers={"Authorization": header}).status_code, 401)
+
+    def test_admin_login_session_expiry_and_logout(self):
+        browser = TestClient(self.app)
+        self.assertEqual(browser.post("/api/auth/login", json={"key": "x" * 40}).status_code, 401)
+        login = browser.post("/api/auth/login", json={"key": ADMIN_KEY})
+        self.assertEqual(login.status_code, 200, login.text)
+        cookie = login.headers["set-cookie"].lower()
+        self.assertIn("httponly", cookie)
+        self.assertIn("samesite=strict", cookie)
+        token = browser.cookies.get("ocr_admin_session")
+        with self.app.state.sessions() as session:
+            # В базе лежит только хэш сессии.
+            self.assertNotIn(token, session.scalars(select(AdminSession.token_hash)).all())
+        self.assertEqual(browser.get("/api/auth/session").json(), {"role": "admin"})
+        self.assertEqual(browser.get("/api/documents").status_code, 200)
+        with self.app.state.sessions.begin() as session:
+            session.execute(update(AdminSession).values(expires_at=0))
+        self.assertEqual(browser.get("/api/auth/session").status_code, 401)
+
+        browser.post("/api/auth/login", json={"key": ADMIN_KEY})
+        token = browser.cookies.get("ocr_admin_session")
+        self.assertEqual(browser.post("/api/auth/logout").status_code, 200)
+        # Старый cookie не оживает, даже если клиент пришлёт его снова.
+        self.assertEqual(TestClient(self.app, cookies={"ocr_admin_session": token}).get("/api/auth/session").status_code, 401)
+
+    def test_admin_key_is_generated_once_when_not_configured(self):
+        storage = self.storage / "fresh"
+        database = f"sqlite:///{(storage / 'fresh.sqlite3').as_posix()}"
+        with patch.dict("os.environ", {"OCR_ADMIN_KEY": ""}):
+            with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as first:
+                key = (storage / "admin-api-key.txt").read_text(encoding="utf-8").strip()
+                self.assertTrue(key.startswith("ocr_admin_"))
+                self.assertEqual(first.post("/api/auth/login", json={"key": key}).status_code, 200)
+            with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as second:
+                self.assertEqual(second.get("/api/auth/session", headers={"Authorization": f"Bearer {key}"}).status_code, 200)
+            self.assertEqual((storage / "admin-api-key.txt").read_text(encoding="utf-8").strip(), key)
+        with patch.dict("os.environ", {"OCR_ADMIN_KEY": "short"}), self.assertRaisesRegex(RuntimeError, "OCR_ADMIN_KEY"):
+            with TestClient(self.make_app()):
+                pass
+
+    def test_integration_key_is_limited_to_assigned_pipelines(self):
+        allowed = self.create_pipeline("Счета")
+        hidden = self.create_pipeline("Договоры")
+        created = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [allowed]})
+        self.assertEqual(created.status_code, 201, created.text)
+        token = created.json()["token"]
+        self.assertTrue(token.startswith("ocr_"))
+        listed = self.client.get("/api/keys").json()["keys"]
+        self.assertEqual([(key["name"], key["pipeline_ids"], key["prefix"]) for key in listed], [("1С", [allowed], token[:12])])
+        # Ключ показывается один раз: ни список, ни база его не содержат.
+        self.assertNotIn(token, json.dumps(listed))
+        with self.app.state.sessions() as session:
+            self.assertNotIn(token, session.scalars(select(APIKey.token_hash)).all())
+
+        integration = TestClient(self.app, headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual([pipeline["id"] for pipeline in integration.get("/api/pipelines").json()["pipelines"]], [allowed])
+        by_path = self.send_document(integration, f"/api/pipelines/{allowed}/run")
+        self.assertEqual(by_path.status_code, 200, by_path.text)
+        self.assertEqual(by_path.json()["text"], "Текст документа")
+        self.assertEqual(self.send_document(integration, "/api/pipeline/run", {"pipeline_id": allowed}).status_code, 200)
+        self.assertEqual(self.send_document(integration, f"/api/pipelines/{hidden}/run").status_code, 403)
+        self.assertEqual(self.send_document(integration, "/api/pipeline/run", {"pipeline_id": hidden}).status_code, 403)
+        self.assertEqual(self.send_document(integration, "/api/pipeline/run", {"pipeline": json.dumps({"source": "document"})}).status_code, 403)
+        for method, url in (("get", "/api/documents"), ("get", "/api/keys"), ("post", "/api/keys"), ("get", "/api/auth/session"), ("post", "/api/pipelines"), ("delete", f"/api/pipelines/{allowed}"), ("get", "/api/litellm/models")):
+            with self.subTest(method=method, url=url):
+                self.assertEqual(getattr(integration, method)(url).status_code, 403)
+        self.assertEqual(TestClient(self.app).post("/api/auth/login", json={"key": token}).status_code, 401)
+
+    def test_key_access_can_be_changed_and_revoked(self):
+        first = self.create_pipeline("Первый")
+        second = self.create_pipeline("Второй")
+        created = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [first]}).json()
+        key_id = created["key"]["id"]
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + created["token"]})
+
+        updated = self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM 2", "pipeline_ids": [second, second]})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual((updated.json()["key"]["name"], updated.json()["key"]["pipeline_ids"]), ("CRM 2", [second]))
+        self.assertEqual(self.send_document(integration, f"/api/pipelines/{first}/run").status_code, 403)
+        self.assertEqual(self.send_document(integration, f"/api/pipelines/{second}/run").status_code, 200)
+
+        self.client.delete(f"/api/pipelines/{first}")
+        for ids in ([first], ["pl_missing"], []):
+            with self.subTest(ids=ids):
+                self.assertEqual(self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM", "pipeline_ids": ids}).status_code, 422)
+                self.assertEqual(self.client.post("/api/keys", json={"name": "Новый", "pipeline_ids": ids}).status_code, 422)
+        self.assertEqual(self.client.post("/api/keys", json={"name": "   ", "pipeline_ids": [second]}).status_code, 422)
+
+        # Удалённый пайплайн пропадает у ключа, не ломая его.
+        self.client.delete(f"/api/pipelines/{second}")
+        self.assertEqual(integration.get("/api/pipelines").json()["pipelines"], [])
+        self.assertEqual(self.send_document(integration, f"/api/pipelines/{second}/run").status_code, 404)
+
+        self.assertEqual(self.client.delete(f"/api/keys/{key_id}").status_code, 200)
+        self.assertEqual(integration.get("/api/pipelines").status_code, 401)
+        self.assertEqual(self.client.delete(f"/api/keys/{key_id}").status_code, 200)
+        self.assertEqual(self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM", "pipeline_ids": [second]}).status_code, 404)
+        self.assertEqual(self.client.delete("/api/keys/missing").status_code, 404)
+        self.assertIsNotNone(self.client.get("/api/keys").json()["keys"][0]["revoked_at"])
 
     def test_models_and_chat(self):
         self.assertEqual(self.client.get("/api/litellm/models").json()["models"], ["extract", "vision"])

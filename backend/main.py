@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from .access import initialize_admin, require_access, router as access_router
 from .database import Base, Document, SavedPipeline, open_database
 from .processing import Pipeline, api_url, complete, extract, litellm_config, proxy_options, recognize, result_fields
 
@@ -72,6 +73,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             # Idempotent: existing tables and documents are preserved on every restart.
             Base.metadata.create_all(engine)
             app.state.sessions = sessions
+            app.state.admin_hash = initialize_admin(storage)
             # PROXY_URL (or HTTP(S)_PROXY) is applied to the environment before the client is built,
             # so httpx sends the external OCR service and LiteLLM traffic through it.
             app.state.proxy = proxy_options()
@@ -83,7 +85,8 @@ def create_app(database_url=None, data_dir=None, transport=None):
         finally:
             engine.dispose()
 
-    app = FastAPI(title="OCR Flow Studio API", lifespan=lifespan)
+    app = FastAPI(title="OCR Flow Studio API", lifespan=lifespan, dependencies=[Depends(require_access)])
+    app.include_router(access_router)
 
     @app.middleware("http")
     async def no_cache(request, call_next):
@@ -124,12 +127,15 @@ def create_app(database_url=None, data_dir=None, transport=None):
         with app.state.sessions() as session:
             session.execute(select(1))
         # Адреса из .env видны в health, чтобы не гадать, что именно прочитал сервер. Ключ не отдаём.
-        return {"status": "ok", "backend": "fastapi-sqlalchemy", "proxy": app.state.proxy, "litellm": os.getenv("LITELLM_BASE_URL", "").strip() or None}
+        return {"status": "ok", "backend": "fastapi-sqlalchemy"}
 
     @app.get("/api/pipelines")
-    def list_pipelines():
+    def list_pipelines(request: Request):
         with app.state.sessions() as session:
-            rows = session.scalars(select(SavedPipeline).where(SavedPipeline.deleted == 0).order_by(SavedPipeline.updated_at.desc(), SavedPipeline.id))
+            query = select(SavedPipeline).where(SavedPipeline.deleted == 0)
+            if not request.state.is_admin:
+                query = query.where(SavedPipeline.id.in_(request.state.pipeline_ids))
+            rows = session.scalars(query.order_by(SavedPipeline.updated_at.desc(), SavedPipeline.id))
             return {"pipelines": [serialize_pipeline(row) for row in rows]}
 
     @app.post("/api/pipelines", status_code=201)
@@ -227,12 +233,38 @@ def create_app(database_url=None, data_dir=None, transport=None):
             raise
         return document_id
 
+    def stored_pipeline(pipeline_id, request):
+        if not request.state.is_admin and pipeline_id not in request.state.pipeline_ids:
+            raise HTTPException(403, "Ключу не разрешён этот пайплайн")
+        with app.state.sessions() as session:
+            row = session.get(SavedPipeline, pipeline_id)
+            if row is None or row.deleted:
+                raise HTTPException(404, "Пайплайн не найден")
+            return Pipeline.model_validate(row.config)
+
+    @app.post("/api/pipelines/{pipeline_id}/run")
+    async def run_saved_pipeline(pipeline_id: str, request: Request, file: UploadFile = File()):
+        parsed = await run_in_threadpool(stored_pipeline, pipeline_id, request)
+        return await process_file(file, parsed)
+
     @app.post("/api/pipeline/run")
-    async def run_pipeline(file: UploadFile = File(), pipeline: str = Form()):
-        try:
-            parsed = Pipeline.model_validate_json(pipeline)
-        except ValidationError as error:
-            raise HTTPException(400, "Некорректная конфигурация пайплайна") from error
+    async def run_pipeline(request: Request, file: UploadFile = File(), pipeline: str | None = Form(default=None), pipeline_id: str | None = Form(default=None)):
+        if pipeline is not None and not request.state.is_admin:
+            raise HTTPException(403, "Передайте pipeline_id: ключ интеграции не может менять конфигурацию")
+        if pipeline_id and pipeline is not None:
+            raise HTTPException(400, "Передайте только pipeline_id или pipeline")
+        if pipeline_id:
+            parsed = await run_in_threadpool(stored_pipeline, pipeline_id, request)
+        elif pipeline is not None and request.state.is_admin:
+            try:
+                parsed = Pipeline.model_validate_json(pipeline)
+            except ValidationError as error:
+                raise HTTPException(400, "Некорректная конфигурация пайплайна") from error
+        else:
+            raise HTTPException(400, "Укажите pipeline_id")
+        return await process_file(file, parsed)
+
+    async def process_file(file, parsed):
         try:
             content = await file.read(MAX_FILE_SIZE + 1)
         finally:

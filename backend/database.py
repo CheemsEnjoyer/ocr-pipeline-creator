@@ -38,6 +38,27 @@ class SavedPipeline(Base):
     deleted: Mapped[int] = mapped_column(Integer, default=0)
 
 
+
+class APIKey(Base):
+    __tablename__ = "api_keys"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    prefix: Mapped[str] = mapped_column(String(20))
+    pipeline_ids: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[str] = mapped_column(String(32))
+    revoked_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class AdminSession(Base):
+    __tablename__ = "admin_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    admin_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[int] = mapped_column(Integer)
+
+
 def open_database(database_url: str):
     url = make_url(database_url)
     if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":

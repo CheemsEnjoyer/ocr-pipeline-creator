@@ -69,3 +69,19 @@
 .document-markdown th{background:var(--muted);font-weight:700}
 .document-markdown hr{margin:1.5em 0;border-top:1px solid var(--border)}
 .document-markdown .contains-task-list{list-style:none}.document-markdown input[type="checkbox"]{margin-right:6px}
+
+
+.login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--background)}
+.login-card{display:grid;gap:16px;width:100%;max-width:460px;background:white;padding:32px;border:1px solid var(--border);border-radius:16px}
+.login-card h1{font-size:23px;font-weight:750}.login-card p,.login-card small{color:#5e7878;line-height:1.6}
+.api-keys-page{max-width:1250px;padding:32px}.api-keys-page h1{font-size:26px;font-weight:750}
+.api-keys-layout{display:grid;grid-template-columns:minmax(260px,360px) minmax(0,1fr);gap:24px;align-items:start}
+.api-key-form,.api-key-card,.api-key-help{background:white;border:1px solid var(--border);border-radius:14px;padding:22px}
+.api-key-form{display:grid;gap:14px}.api-key-form h2,.api-key-card h2,.api-key-help h2{font-size:18px;font-weight:700}
+.api-key-form small,.api-key-card p{color:#6e8182;font-size:13px}.api-key-form legend{font-size:14px;font-weight:600;margin-bottom:10px}
+.key-pipeline-list{max-height:300px;overflow:auto;display:grid;gap:12px}.key-pipeline-list label{display:flex;gap:10px;align-items:flex-start;font-size:14px;cursor:pointer;overflow-wrap:anywhere}
+.api-key-list{display:grid;gap:16px;min-width:0}.api-key-card-title{display:flex;justify-content:space-between;gap:12px;align-items:center;overflow-wrap:anywhere}
+.api-key-card-title span{font-size:12px;color:#5e7878;flex-shrink:0}.api-key-card code{display:block;margin:10px 0;color:#5e7878}
+.api-key-card ul{display:grid;gap:8px;margin:14px 0;font-size:14px;overflow-wrap:anywhere}.api-key-card li small{display:block;color:#6e8182;font-size:11px}
+.api-key-actions{display:flex;gap:10px;flex-wrap:wrap}.api-key-help{margin-top:24px;line-height:1.8;overflow-wrap:anywhere}
+@media(max-width:900px){.api-keys-layout{grid-template-columns:minmax(0,1fr)}.api-keys-page{padding:20px 14px}.login-card{padding:24px}}
