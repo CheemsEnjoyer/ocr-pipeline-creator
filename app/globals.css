@@ -74,14 +74,33 @@
 .login-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--background)}
 .login-card{display:grid;gap:16px;width:100%;max-width:460px;background:white;padding:32px;border:1px solid var(--border);border-radius:16px}
 .login-card h1{font-size:23px;font-weight:750}.login-card p,.login-card small{color:#5e7878;line-height:1.6}
-.api-keys-page{max-width:1250px;padding:32px}.api-keys-page h1{font-size:26px;font-weight:750}
-.api-keys-layout{display:grid;grid-template-columns:minmax(260px,360px) minmax(0,1fr);gap:24px;align-items:start}
-.api-key-form,.api-key-card,.api-key-help{background:white;border:1px solid var(--border);border-radius:14px;padding:22px}
-.api-key-form{display:grid;gap:14px}.api-key-form h2,.api-key-card h2,.api-key-help h2{font-size:18px;font-weight:700}
-.api-key-form small,.api-key-card p{color:#6e8182;font-size:13px}.api-key-form legend{font-size:14px;font-weight:600;margin-bottom:10px}
-.key-pipeline-list{max-height:300px;overflow:auto;display:grid;gap:12px}.key-pipeline-list label{display:flex;gap:10px;align-items:flex-start;font-size:14px;cursor:pointer;overflow-wrap:anywhere}
-.api-key-list{display:grid;gap:16px;min-width:0}.api-key-card-title{display:flex;justify-content:space-between;gap:12px;align-items:center;overflow-wrap:anywhere}
-.api-key-card-title span{font-size:12px;color:#5e7878;flex-shrink:0}.api-key-card code{display:block;margin:10px 0;color:#5e7878}
-.api-key-card ul{display:grid;gap:8px;margin:14px 0;font-size:14px;overflow-wrap:anywhere}.api-key-card li small{display:block;color:#6e8182;font-size:11px}
-.api-key-actions{display:flex;gap:10px;flex-wrap:wrap}.api-key-help{margin-top:24px;line-height:1.8;overflow-wrap:anywhere}
-@media(max-width:900px){.api-keys-layout{grid-template-columns:minmax(0,1fr)}.api-keys-page{padding:20px 14px}.login-card{padding:24px}}
+.api-keys-page{max-width:1250px;padding:32px;display:grid;gap:18px}.api-keys-page h1{font-size:26px;font-weight:750}.api-keys-page .pipelines-heading{margin-bottom:0}
+.api-keys-heading-actions{display:flex;gap:10px;flex-wrap:wrap}
+.api-keys-panel{background:#fff;border:1px solid var(--border);border-radius:14px;overflow:hidden;min-width:0}
+.api-keys-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:14px 16px;border-bottom:1px solid var(--border)}
+.api-keys-search{position:relative;flex:1 1 260px;min-width:0}.api-keys-search svg{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#7e9091;pointer-events:none}.api-keys-search input{padding-left:34px}
+.api-keys-status{display:inline-flex;padding:3px;gap:2px;background:var(--muted);border-radius:9px}
+.api-keys-status button{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:#577071;font-size:13px;padding:6px 10px;border-radius:7px;cursor:pointer;white-space:nowrap}
+.api-keys-status button span{font-size:11px;color:#7e9091;font-variant-numeric:tabular-nums}
+.api-keys-status button[aria-pressed="true"]{background:#fff;color:#00504e;font-weight:650;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.api-keys-table th{color:#6e8182;font-size:12px;font-weight:600;padding:10px 16px;background:#f8fbfb}
+.api-keys-table td{padding:10px 16px}
+.api-keys-table tr{border-color:var(--border)}.api-keys-table tr.revoked td{color:#7e9091}
+.api-key-name{display:grid;gap:2px;min-width:0;max-width:320px}.api-key-name strong{font-weight:650;overflow:hidden;text-overflow:ellipsis}.api-key-name code{font-size:12px;color:#7e9091}
+.api-key-pipelines{display:grid;gap:2px;max-width:340px}.api-key-pipelines small{color:#7e9091;font-size:12px;overflow:hidden;text-overflow:ellipsis}
+.api-key-status small{display:block;color:#7e9091;font-size:11px;margin-top:3px}
+.api-key-row-actions{text-align:right;width:1%}.api-key-row-actions button+button{margin-left:4px}.api-key-revoke:hover{background:#ffebe6!important;color:#b33f2d!important}
+.api-keys-pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--border);color:#6e8182;font-size:13px}.api-keys-pager span{margin-right:auto;font-variant-numeric:tabular-nums}
+.api-keys-panel .history-empty,.api-keys-panel .history-loading{padding:40px 16px}
+.api-key-dialog-form{display:grid;gap:16px;min-width:0}
+.api-key-field{display:grid;gap:8px;min-width:0;border:0;padding:0;margin:0}.api-key-field legend{display:flex;justify-content:space-between;gap:12px;width:100%;font-size:14px;font-weight:600;margin-bottom:8px}.api-key-field legend span{font-weight:400;font-size:12px;color:#6e8182}.api-key-field>small{color:#6e8182;font-size:12px}
+.api-key-select-actions{display:flex;gap:14px}.api-key-select-actions button{border:0;background:none;padding:0;color:#00504e;font-size:13px;cursor:pointer}.api-key-select-actions button:disabled{color:#9aabab;cursor:default}
+.key-pipeline-list{max-height:280px;overflow:auto;display:grid;gap:2px;border:1px solid var(--border);border-radius:10px;padding:6px}.key-pipeline-list label{display:flex;gap:10px;align-items:center;font-size:14px;cursor:pointer;overflow-wrap:anywhere;padding:7px 8px;border-radius:7px}.key-pipeline-list label:hover{background:#f0f6f6}.key-pipeline-list p{margin:8px;color:#6e8182;font-size:13px}
+.api-key-help{background:#fff;border:1px solid var(--border);border-radius:14px;padding:14px 18px;line-height:1.7;overflow-wrap:anywhere;font-size:14px}.api-key-help summary{cursor:pointer;font-weight:650}.api-key-help[open] summary{margin-bottom:8px}.api-key-help ul{margin:6px 0 0;padding-left:18px;list-style:disc}
+@media(max-width:900px){.api-keys-page{padding:20px 14px}.login-card{padding:24px}
+.api-keys-table thead{display:none}.api-keys-table tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;padding:12px 14px}
+.api-keys-table td{display:block;padding:0;white-space:normal;min-width:0}
+.api-keys-table td[data-label="Интеграция"]{grid-column:1;grid-row:1}.api-keys-table td[data-label="Статус"]{grid-column:2;grid-row:1;text-align:right}
+.api-keys-table td[data-label="Пайплайны"]{grid-column:1;grid-row:2}.api-keys-table td[data-label="Создан"]{grid-column:1;grid-row:3;color:#7e9091;font-size:12px}
+.api-key-row-actions{grid-column:2;grid-row:2/span 2;align-self:end;width:auto}
+.api-key-name,.api-key-pipelines{max-width:none}}
