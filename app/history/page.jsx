@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Check, Download, FileText, History, LoaderCircle, Save, ScanText } from "lucide-react";
 import Header from "@/components/Header";
+import ExtractedText from "@/components/ExtractedText";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -141,7 +142,7 @@ export default function HistoryPage() {
             <Tabs defaultValue="text" key={document.id} className="document-viewer">
               <div className="document-viewer-toolbar"><TabsList aria-label="Содержимое документа"><TabsTrigger value="original">Исходный документ</TabsTrigger><TabsTrigger value="text">Извлечённый текст</TabsTrigger></TabsList></div>
               <TabsContent value="original"><OriginalDocument document={document}/></TabsContent>
-              <TabsContent value="text"><pre className="document-text">{document.text || "В документе не найден текст."}</pre></TabsContent>
+              <TabsContent value="text"><ExtractedText text={document.text}/></TabsContent>
             </Tabs>
             <aside className="extracted-panel">
               <div className="extracted-heading"><div><h3>Извлечённые поля</h3><p>Проверьте и уточните значения</p></div><span>{Object.keys(document.fields).length}</span></div>
