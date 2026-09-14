@@ -137,6 +137,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.calls[0].url.path, "/v1/chat/completions")
         self.assertTrue(json.loads(self.calls[0].content)["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertEqual(json.loads(self.calls[1].content)["messages"][1]["content"], "Распознанный текст")
+        self.assertEqual(json.loads(self.calls[1].content)["response_format"], {"type": "json_object"})
 
     def test_pipeline_temperatures(self):
         for temperatures in ({}, {"ocr": 0.3, "extraction": 0.8}, {"ocr": 0, "extraction": 2}):
@@ -148,6 +149,30 @@ class APITests(unittest.TestCase):
                 response = self.upload(b"image", "scan.png", "image/png", pipeline)
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual([json.loads(call.content)["temperature"] for call in self.calls], [temperatures.get("ocr", 0), temperatures.get("extraction", 0)])
+
+    def test_prompt_result_stays_text_even_if_model_returns_json(self):
+        pipeline = {"source": "document", "extraction": {"mode": "prompt", "model": "extract", "prompt": "Кратко опиши документ"}}
+        response = self.upload(pipeline=pipeline)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = json.loads(self.calls[-1].content)
+        self.assertNotIn("response_format", payload)
+        self.assertNotIn("только валидным JSON", payload["messages"][0]["content"])
+        self.assertIn("Кратко опиши документ", payload["messages"][0]["content"])
+        with self.restarted_app() as client:
+            row = client.get(f"/api/documents/{response.json()['documentId']}").json()["document"]
+            self.assertEqual(row["fields"], {})
+            self.assertEqual(row["result"], response.json()["result"])
+
+    def test_prompt_result_preserves_paragraphs(self):
+        result = "Общее описание документа.\n\nВторой абзац с выводами."
+        pipeline = {"source": "document", "extraction": {"mode": "prompt", "model": "extract", "prompt": "Опиши документ"}}
+        with patch("backend.processing.complete", return_value=result) as completion:
+            response = self.upload(pipeline=pipeline)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("response_format", completion.call_args.args[1])
+        row = self.client.get(f"/api/documents/{response.json()['documentId']}").json()["document"]
+        self.assertEqual(row["result"], result)
+        self.assertEqual(row["fields"], {})
 
     def test_invalid_temperatures_do_not_call_upstream(self):
         for stage in ("ocr", "extraction"):

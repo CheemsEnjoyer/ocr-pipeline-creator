@@ -160,11 +160,12 @@ async def recognize(client, pipeline, content, filename, mime):
 async def extract(client, extraction, text):
     schema = {field.name: {"type": "string", "description": field.description} for field in extraction.fields}
     instruction = extraction.prompt if extraction.mode == "prompt" else f"Извлеки значения полей по схеме: {json.dumps(schema, ensure_ascii=False)}"
+    structured = extraction.mode == "fields"
     return await complete(client, {
         "model": extraction.model, "temperature": extraction.temperature, "max_tokens": extraction.max_tokens,
-        "response_format": {"type": "json_object"},
+        **({"response_format": {"type": "json_object"}} if structured else {}),
         "messages": [
-            {"role": "system", "content": f"{instruction}\nОтвечай только валидным JSON без пояснений."},
+            {"role": "system", "content": f"{instruction}\n" + ("Отвечай только валидным JSON без пояснений." if structured else "Верни ответ единым текстом. Не создавай JSON-объект и именованные поля результата.")},
             {"role": "user", "content": text},
         ],
     })

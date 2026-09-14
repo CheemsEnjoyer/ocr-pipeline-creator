@@ -145,8 +145,8 @@ export default function HistoryPage() {
               <TabsContent value="text"><ExtractedText text={document.text}/></TabsContent>
             </Tabs>
             <aside className="extracted-panel">
-              <div className="extracted-heading"><div><h3>Извлечённые поля</h3><p>Проверьте и уточните значения</p></div><span>{Object.keys(document.fields).length}</span></div>
-              {!Object.keys(document.fields).length && <div className="history-empty"><ScanText size={25}/><p>Структурированные поля не получены. Результат доступен ниже.</p><pre className="raw-extraction">{document.result || "Нет результата"}</pre></div>}
+              <div className="extracted-heading"><div><h3>{Object.keys(document.fields).length ? "Извлечённые поля" : "Результат обработки"}</h3>{Object.keys(document.fields).length > 0 && <p>Проверьте и уточните значения</p>}</div>{Object.keys(document.fields).length > 0 && <span>{Object.keys(document.fields).length}</span>}</div>
+              {!Object.keys(document.fields).length && <div className="history-empty"><pre className="raw-extraction">{document.result || "Нет результата"}</pre></div>}
               <div className="extracted-fields">{Object.entries(document.fields).map(([key, value], index) => <div className="extracted-field" key={key}>
                 <label htmlFor={`extracted-${index}`}>{key}</label>
                 <Textarea id={`extracted-${index}`} value={draft[key] ?? ""} disabled={saving} rows={typeof value === "object" && value !== null ? 5 : 2} onChange={(event) => { setDraft((current) => ({ ...current, [key]: event.target.value })); setSaved(false); }}/>

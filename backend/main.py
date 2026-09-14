@@ -233,14 +233,14 @@ def create_app(database_url=None, data_dir=None, transport=None):
             inline = re.fullmatch(r"application/pdf|image/(png|jpeg|gif|webp|avif|bmp)", row.mime_type) and "download" not in request.query_params
             return FileResponse(path, filename=row.filename, media_type=row.mime_type, content_disposition_type="inline" if inline else "attachment", headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
 
-    def persist(content, filename, mime, pipeline_name, text, result, pipeline_id=None, api_key_id=None):
+    def persist(content, filename, mime, pipeline_name, text, result, pipeline_id=None, api_key_id=None, plain_text=False):
         document_id = str(uuid4())
         path = storage / "originals" / document_id
         try:
             path.write_bytes(content)
             timestamp = now()
             with app.state.sessions.begin() as session:
-                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=document_id, text=text, result=result, fields=result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id))
+                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=document_id, text=text, result=result, fields={} if plain_text else result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id))
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -290,7 +290,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         mime = file.content_type or "application/octet-stream"
         text = await recognize(app.state.client, parsed, content, filename, mime)
         result = await extract(app.state.client, parsed.extraction, text) if parsed.extraction else text
-        document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result, pipeline_id, request.state.api_key_id)
+        document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result, pipeline_id, request.state.api_key_id, bool(parsed.extraction and parsed.extraction.mode == "prompt"))
         return {"file": filename, "text": text, "result": result, "documentId": document_id}
 
     @app.get("/api/litellm/models")
