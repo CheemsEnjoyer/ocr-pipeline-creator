@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select, update
+from sqlalchemy import create_engine, inspect, select, update
+from sqlalchemy import text as sql
 
 from backend.access import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
 from backend.database import AdminSession, APIKey
@@ -321,7 +322,87 @@ class APITests(unittest.TestCase):
         # Администратор получает тот же список, а служебные разделы под /api/v1 не публикуются.
         self.assertEqual(self.client.get("/api/v1/pipelines").json(), self.client.get("/api/pipelines").json())
         self.assertEqual(self.client.get("/api/v1/keys").status_code, 404)
-        self.assertEqual(self.client.get("/api/v1/documents").status_code, 404)
+
+    def test_integration_key_sees_only_documents_it_processed(self):
+        pipeline = self.create_pipeline("Счета")
+        first = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [pipeline]}).json()
+        second = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [pipeline]}).json()
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + first["token"]})
+        other = TestClient(self.app, headers={"Authorization": "Bearer " + second["token"]})
+
+        own = [
+            self.send_document(integration, f"/api/v1/pipelines/{pipeline}/run").json()["documentId"],
+            self.send_document(integration, "/api/pipeline/run", {"pipeline_id": pipeline}).json()["documentId"],
+        ]
+        foreign = self.send_document(other, f"/api/v1/pipelines/{pipeline}/run").json()["documentId"]
+        manual = self.upload().json()["documentId"]
+
+        listed = integration.get("/api/v1/documents")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(sorted(item["id"] for item in listed.json()["documents"]), sorted(own))
+        self.assertFalse(listed.json()["hasMore"])
+        self.assertEqual({item["pipeline_id"] for item in listed.json()["documents"]}, {pipeline})
+
+        detail = integration.get(f"/api/v1/documents/{own[0]}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        document = detail.json()["document"]
+        self.assertEqual((document["text"], document["pipeline_id"], document["pipeline_name"]), ("Текст документа", pipeline, "Счета"))
+        # Чужой документ неотличим от несуществующего.
+        for hidden in (foreign, manual, "missing"):
+            with self.subTest(document=hidden):
+                self.assertEqual(integration.get(f"/api/v1/documents/{hidden}").status_code, 404)
+        self.assertEqual([item["id"] for item in other.get("/api/v1/documents").json()["documents"]], [foreign])
+
+        # Поля, исправленные оператором в истории, интеграция получает уже исправленными.
+        self.assertEqual(self.client.patch(f"/api/documents/{own[0]}", json={"fields": {"total": "1 500"}, "revision": 0}).status_code, 200)
+        self.assertEqual(integration.get(f"/api/v1/documents/{own[0]}").json()["document"]["fields"], {"total": "1 500"})
+
+        # Общая история, исходный файл и правка полей ключу недоступны.
+        self.assertEqual(integration.get("/api/documents").status_code, 403)
+        self.assertEqual(integration.get(f"/api/documents/{own[0]}").status_code, 403)
+        self.assertEqual(integration.get(f"/api/documents/{own[0]}/original").status_code, 403)
+        self.assertEqual(integration.patch(f"/api/documents/{own[0]}", json={"fields": {}, "revision": 1}).status_code, 403)
+        self.assertEqual(integration.get(f"/api/v1/documents/{own[0]}/original").status_code, 404)
+
+        # Администратор по-прежнему видит всю историю, в том числе через /api/v1.
+        self.assertEqual({item["id"] for item in self.client.get("/api/v1/documents").json()["documents"]}, {*own, foreign, manual})
+        self.assertIsNone(self.client.get(f"/api/documents/{manual}").json()["document"]["pipeline_id"])
+
+        # Отозванный ключ теряет доступ, а новый ключ той же интеграции старые документы не видит.
+        self.client.delete(f"/api/keys/{first['key']['id']}")
+        self.assertEqual(integration.get("/api/v1/documents").status_code, 401)
+        replacement = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [pipeline]}).json()["token"]
+        self.assertEqual(TestClient(self.app, headers={"Authorization": "Bearer " + replacement}).get("/api/v1/documents").json()["documents"], [])
+
+    def test_existing_documents_table_is_upgraded(self):
+        storage = self.storage / "legacy"
+        storage.mkdir()
+        database = f"sqlite:///{(storage / 'legacy.sqlite3').as_posix()}"
+        engine = create_engine(database)
+        with engine.begin() as connection:
+            # Схема таблицы документов до появления pipeline_id и api_key_id.
+            connection.execute(sql("CREATE TABLE documents (id VARCHAR(36) PRIMARY KEY, filename TEXT, mime_type TEXT, size INTEGER, pipeline_name TEXT, original_key TEXT, text TEXT, result TEXT, fields JSON, created_at VARCHAR(32), updated_at VARCHAR(32), revision INTEGER)"))
+            connection.execute(sql("INSERT INTO documents VALUES ('old-doc', 'old.txt', 'text/plain', 3, 'Старый', 'old-doc', 'abc', 'abc', '{}', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', 0)"))
+        engine.dispose()
+
+        app = create_app(database, storage, httpx.MockTransport(self.upstream))
+        with TestClient(app) as client:
+            self.sign_in(client)
+            with app.state.sessions() as session:
+                inspector = inspect(session.get_bind())
+                self.assertLessEqual({"pipeline_id", "api_key_id"}, {column["name"] for column in inspector.get_columns("documents")})
+                self.assertIn("idx_documents_api_key", {index["name"] for index in inspector.get_indexes("documents")})
+            old = client.get("/api/documents/old-doc").json()["document"]
+            self.assertEqual((old["filename"], old["fields"], old["pipeline_id"]), ("old.txt", {}, None))
+            pipeline = client.post("/api/pipelines", json={"name": "Новый", "source": "document", "extraction": None}).json()["pipeline"]["id"]
+            token = client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [pipeline]}).json()["token"]
+            integration = TestClient(app, headers={"Authorization": "Bearer " + token})
+            # Старые документы остаются только у администратора.
+            self.assertEqual(integration.get("/api/v1/documents").json()["documents"], [])
+            self.assertEqual(integration.get("/api/v1/documents/old-doc").status_code, 404)
+        # Повторный запуск на уже обновлённой базе проходит без ошибок.
+        with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as again:
+            self.assertEqual(self.sign_in(again).get("/api/documents").json()["documents"][0]["id"], "old-doc")
 
     def test_key_access_can_be_changed_and_revoked(self):
         first = self.create_pipeline("Первый")

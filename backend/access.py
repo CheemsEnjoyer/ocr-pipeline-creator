@@ -77,6 +77,7 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
         return
     request.state.is_admin = False
     request.state.pipeline_ids = []
+    request.state.api_key_id = None
     authorization = request.headers.get("authorization")
     if authorization is not None:
         # В заголовке принимаются только ключи интеграций; администратор входит через сессию.
@@ -87,12 +88,14 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
             if key is None:
                 raise HTTPException(401, "API-ключ недействителен или отозван")
             request.state.pipeline_ids = list(key.pipeline_ids)
+            request.state.api_key_id = key.id
         # Основной адрес интеграций — /api/v1; пути без версии разрешены для совместимости.
-        allowed = (request.method == "GET" and path in ("/api/pipelines", "/api/v1/pipelines")) or (
+        # Документы ключу доступны только через /api/v1, и только те, что он обработал сам.
+        allowed = (request.method == "GET" and (path in ("/api/pipelines", "/api/v1/pipelines", "/api/v1/documents") or re.fullmatch(r"/api/v1/documents/[^/]+", path))) or (
             request.method == "POST" and (path in ("/api/pipeline/run", "/api/v1/pipeline/run") or re.fullmatch(r"/api(?:/v1)?/pipelines/[^/]+/run", path))
         )
         if not allowed:
-            raise HTTPException(403, "Этот API-ключ разрешает только просмотр и запуск назначенных пайплайнов")
+            raise HTTPException(403, "Этот API-ключ разрешает только работу с назначенными пайплайнами и своими документами")
         return
     cookie = request.cookies.get(COOKIE)
     if cookie and len(cookie) <= 512:

@@ -13,12 +13,12 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request,
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import false, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .access import initialize_admin, require_access, router as access_router
-from .database import Base, Document, SavedPipeline, open_database
+from .database import Base, Document, SavedPipeline, open_database, upgrade_schema
 from .processing import Pipeline, api_url, complete, extract, litellm_config, proxy_options, recognize, result_fields
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +32,7 @@ def now():
 
 
 def serialize(document, detail=False):
-    names = ["id", "filename", "mime_type", "size", "pipeline_name", "created_at", "updated_at"]
+    names = ["id", "filename", "mime_type", "size", "pipeline_name", "pipeline_id", "created_at", "updated_at"]
     if detail:
         names += ["text", "result", "fields", "revision"]
     return {name: getattr(document, name) for name in names}
@@ -72,6 +72,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         try:
             # Idempotent: existing tables and documents are preserved on every restart.
             Base.metadata.create_all(engine)
+            upgrade_schema(engine)
             app.state.sessions = sessions
             initialize_admin(app, storage)
             # PROXY_URL (or HTTP(S)_PROXY) is applied to the environment before the client is built,
@@ -184,16 +185,25 @@ def create_app(database_url=None, data_dir=None, transport=None):
             session.commit()
         return {"status": "ok"}
 
+    def visible_documents(request):
+        # Администратор видит всю историю, ключ интеграции — только документы, которые обработал сам.
+        query = select(Document)
+        if request.state.is_admin:
+            return query
+        return query.where(Document.api_key_id == request.state.api_key_id) if request.state.api_key_id else query.where(false())
+
+    @app.get("/api/v1/documents")
     @app.get("/api/documents")
-    def documents(page: int = Query(default=0, ge=0)):
+    def documents(request: Request, page: int = Query(default=0, ge=0)):
         with app.state.sessions() as session:
-            rows = session.scalars(select(Document).order_by(Document.created_at.desc(), Document.id.desc()).offset(page * 50).limit(51)).all()
+            rows = session.scalars(visible_documents(request).order_by(Document.created_at.desc(), Document.id.desc()).offset(page * 50).limit(51)).all()
             return {"documents": [serialize(row) for row in rows[:50]], "hasMore": len(rows) > 50}
 
+    @app.get("/api/v1/documents/{document_id}")
     @app.get("/api/documents/{document_id}")
-    def document(document_id: str):
+    def document(document_id: str, request: Request):
         with app.state.sessions() as session:
-            row = session.get(Document, document_id)
+            row = session.scalar(visible_documents(request).where(Document.id == document_id))
             if row is None:
                 raise HTTPException(404, "Документ не найден")
             return {"document": serialize(row, detail=True)}
@@ -223,14 +233,14 @@ def create_app(database_url=None, data_dir=None, transport=None):
             inline = re.fullmatch(r"application/pdf|image/(png|jpeg|gif|webp|avif|bmp)", row.mime_type) and "download" not in request.query_params
             return FileResponse(path, filename=row.filename, media_type=row.mime_type, content_disposition_type="inline" if inline else "attachment", headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
 
-    def persist(content, filename, mime, pipeline_name, text, result):
+    def persist(content, filename, mime, pipeline_name, text, result, pipeline_id=None, api_key_id=None):
         document_id = str(uuid4())
         path = storage / "originals" / document_id
         try:
             path.write_bytes(content)
             timestamp = now()
             with app.state.sessions.begin() as session:
-                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=document_id, text=text, result=result, fields=result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0))
+                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=document_id, text=text, result=result, fields=result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id))
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -249,7 +259,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
     @app.post("/api/pipelines/{pipeline_id}/run")
     async def run_saved_pipeline(pipeline_id: str, request: Request, file: UploadFile = File()):
         parsed = await run_in_threadpool(stored_pipeline, pipeline_id, request)
-        return await process_file(file, parsed)
+        return await process_file(file, parsed, request, pipeline_id)
 
     @app.post("/api/v1/pipeline/run")
     @app.post("/api/pipeline/run")
@@ -267,9 +277,9 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(400, "Некорректная конфигурация пайплайна") from error
         else:
             raise HTTPException(400, "Укажите pipeline_id")
-        return await process_file(file, parsed)
+        return await process_file(file, parsed, request, pipeline_id or None)
 
-    async def process_file(file, parsed):
+    async def process_file(file, parsed, request, pipeline_id=None):
         try:
             content = await file.read(MAX_FILE_SIZE + 1)
         finally:
@@ -280,7 +290,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         mime = file.content_type or "application/octet-stream"
         text = await recognize(app.state.client, parsed, content, filename, mime)
         result = await extract(app.state.client, parsed.extraction, text) if parsed.extraction else text
-        document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result)
+        document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result, pipeline_id, request.state.api_key_id)
         return {"file": filename, "text": text, "result": result, "documentId": document_id}
 
     @app.get("/api/litellm/models")

@@ -1,26 +1,28 @@
 "use client";
 
 import { useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Checkbox } from "@/components/ui/checkbox";
 
-const markdownComponents = {
-  a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-  img: ({ src, alt }) => <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Изображение"}</a>,
-  table: ({ children }) => <div className="document-markdown-table" role="region" aria-label="Таблица из документа" tabIndex={0}><table>{children}</table></div>,
-};
+const htmlHead = `<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{margin:0;padding:25px;font:14px/1.7 "Segoe UI",Arial,sans-serif;color:#334d4e;overflow-wrap:anywhere;white-space:pre-wrap}
+table{border-collapse:collapse;white-space:normal;font-size:13px}
+th,td{border:1px solid #d8e5e5;padding:8px 10px;text-align:left;vertical-align:top;min-width:120px;max-width:260px}
+th{background:#edf3f3}pre{white-space:pre;overflow:auto}img{max-width:100%;height:auto}a{color:#00504e}
+</style></head><body>`;
 
 export default function ExtractedText({ text }) {
-  const [markdown, setMarkdown] = useState(false);
+  const [html, setHtml] = useState(false);
   const content = text || "В документе не найден текст.";
   return <>
-    <label className="document-markdown-toggle">
-      <Checkbox checked={markdown} onCheckedChange={(checked) => setMarkdown(checked === true)}/>
-      <span>Просмотреть в Markdown</span>
+    <label className="document-html-toggle">
+      <Checkbox checked={html} onCheckedChange={(checked) => setHtml(checked === true)}/>
+      <span>Просмотреть в .html</span>
     </label>
-    {markdown
-      ? <div className="document-text document-markdown"><Markdown remarkPlugins={[remarkGfm]} skipHtml components={markdownComponents}>{content}</Markdown></div>
+    {html
+      ? <iframe className="document-html" title="Текст документа в HTML" sandbox="" referrerPolicy="no-referrer" srcDoc={`${htmlHead}${content}</body></html>`}/>
       : <pre className="document-text">{content}</pre>}
   </>;
 }

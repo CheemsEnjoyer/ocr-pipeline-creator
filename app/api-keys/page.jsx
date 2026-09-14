@@ -171,7 +171,8 @@ export default function APIKeysPage() {
         <p>Передавайте ключ в заголовке <code>Authorization: Bearer ВАШ_КЛЮЧ</code>.</p>
         <ul>
           <li><code>GET /api/v1/pipelines</code> — пайплайны, доступные ключу;</li>
-          <li><code>POST /api/v1/pipelines/ID/run</code> — обработка документа из поля формы <code>file</code>.</li>
+          <li><code>POST /api/v1/pipelines/ID/run</code> — обработка документа из поля формы <code>file</code>;</li>
+          <li><code>GET /api/v1/documents</code> и <code>GET /api/v1/documents/ID</code> — документы, обработанные этим ключом.</li>
         </ul>
       </details>
     </div>
