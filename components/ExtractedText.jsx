@@ -16,13 +16,14 @@ th{background:#edf3f3}pre{white-space:pre;overflow:auto}img{max-width:100%;heigh
 export default function ExtractedText({ text }) {
   const [html, setHtml] = useState(false);
   const content = text || "В документе не найден текст.";
+  const htmlContent = content.split(/\r\n|\r|\n/).filter((line) => line.trim().length > 0).join("\n");
   return <>
     <label className="document-html-toggle">
       <Checkbox checked={html} onCheckedChange={(checked) => setHtml(checked === true)}/>
       <span>Просмотреть в .html</span>
     </label>
     {html
-      ? <iframe className="document-html" title="Текст документа в HTML" sandbox="" referrerPolicy="no-referrer" srcDoc={`${htmlHead}${content}</body></html>`}/>
+      ? <iframe className="document-html" title="Текст документа в HTML" sandbox="" referrerPolicy="no-referrer" srcDoc={`${htmlHead}${htmlContent}</body></html>`}/>
       : <pre className="document-text">{content}</pre>}
   </>;
 }
