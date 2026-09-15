@@ -8,6 +8,8 @@
   "scripts": {
     "install:ci": "node scripts/install-ci.mjs",
     "dev": "node scripts/run-app.mjs dev",
+    "simulator": "node scripts/import-simulator.mjs",
+    "test:simulator": "node --test scripts/import-simulator.test.mjs",
     "build": "vinext build",
     "start": "node scripts/run-app.mjs start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",

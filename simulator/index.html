@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Симулятор интеграции · OCR Flow</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#172338;font:15px system-ui,sans-serif}main{max-width:1040px;margin:40px auto;padding:0 20px}h1{font-size:30px;margin-bottom:8px}h2{font-size:19px;margin-top:0}p{color:#536079;line-height:1.6}.card{background:white;border:1px solid #dce2ec;border-radius:14px;padding:24px;margin:18px 0}label{display:block;margin:14px 0 6px;font-weight:600}input,select,button{font:inherit;border-radius:8px;padding:11px;border:1px solid #cbd4e2}input[type=password],select{width:100%}button{cursor:pointer;background:#254edb;color:white;border:0;margin:12px 8px 0 0}button.secondary{background:#eaf0ff;color:#2543a0}button:disabled{opacity:.5;cursor:wait}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.grid .card{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101b30;color:#dce7ff;padding:18px;border-radius:8px;max-height:440px;overflow:auto;font-size:13px}#status{padding:14px;border-radius:8px;background:#e7edfb;white-space:pre-wrap}#status.error{background:#ffe8e7;color:#9c2520}small{color:#536079}ul{padding:0;list-style:none}li button{text-align:left;width:100%;margin-top:5px;background:#edf1f8;color:#172338}a{color:#254edb}@media(max-width:700px){.grid{grid-template-columns:1fr}main{margin-top:24px}}
+</style>
+<main>
+  <small>OCR FLOW / ТЕСТОВАЯ ИНТЕГРАЦИЯ</small>
+  <h1>Симулятор импорта по API</h1>
+  <p>Проверьте путь внешней системы: отправьте документ в OCR и импортируйте готовый результат вместе с правками оператора.</p>
+  <section class="card">
+    <h2>1. Подключение</h2>
+    <label for="key">API-ключ из раздела «API-ключи»</label>
+    <input id="key" type="password" placeholder="ocr_…" autocomplete="off" spellcheck="false">
+    <button id="connect">Подключиться</button>
+    <small>Ключ хранится только в памяти страницы. Смена ключа очищает импортированные данные.</small>
+  </section>
+  <div class="grid">
+    <section class="card">
+      <h2>2. Отправка в OCR</h2>
+      <label for="pipeline">Разрешённый пайплайн</label>
+      <select id="pipeline"><option value="">Сначала подключитесь</option></select>
+      <label for="file">Документ до 20 МБ</label>
+      <input id="file" type="file">
+      <button id="upload" disabled>Отправить на обработку</button>
+      <p>Это реальный запуск выбранного пайплайна. Документ появится в истории OCR; настройки могут включать обращения к платным моделям.</p>
+    </section>
+    <section class="card">
+      <h2>3. Импорт во внешнюю систему</h2>
+      <p>Загружает все документы этого ключа по страницам, затем получает полный результат каждого. Повторный импорт обновляет записи по ID без дублей.</p>
+      <button id="sync" disabled>Импортировать / обновить</button>
+      <button id="download" class="secondary" disabled>Скачать JSON</button>
+      <p>После правки полей в истории OCR повторите импорт. Локальная копия живёт до перезагрузки страницы.</p>
+    </section>
+  </div>
+  <section class="card">
+    <div id="status" role="status" aria-live="polite">Введите ключ, чтобы начать.</div>
+    <p id="count">Импортировано: 0</p>
+    <ul id="documents"></ul>
+    <h2>Ответ API / импортированный документ</h2>
+    <pre id="result">Здесь появится JSON.</pre>
+    <details><summary>Журнал запросов (без ключа)</summary><pre id="log">Запросов пока нет.</pre></details>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let documents = new Map(), connected = false, busy = false;
+function controls() {
+  $('key').disabled = busy; $('connect').disabled = busy;
+  $('upload').disabled = busy || !connected || !$('pipeline').value;
+  $('sync').disabled = busy || !connected;
+  $('download').disabled = busy || !documents.size;
+}
+function status(message, error = false) { $('status').textContent = message; $('status').className = error ? 'error' : ''; }
+function show(value) { $('result').textContent = JSON.stringify(value, null, 2); }
+async function request(path, options = {}) {
+  const start = performance.now();
+  const response = await fetch(path, { ...options, credentials: 'omit', headers: { Authorization: 'Bearer ' + $('key').value.trim() } });
+  const line = `${new Date().toLocaleTimeString()} ${options.method || 'GET'} ${path} → ${response.status} (${Math.round(performance.now() - start)} мс)`;
+  $('log').textContent = (line + '\n' + ($('log').textContent === 'Запросов пока нет.' ? '' : $('log').textContent)).slice(0, 16000);
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(`HTTP ${response.status}: API вернул некорректный JSON`); }
+  if (!response.ok) {
+    const hints = {401:'Ключ неверный или отозван.',403:'Ключу не разрешено это действие.',404:'Документ или пайплайн недоступен.'};
+    throw new Error(`HTTP ${response.status}. ${hints[response.status] || ''} ${typeof data.detail === 'string' ? data.detail : JSON.stringify(data)}`);
+  }
+  return data;
+}
+async function action(fn) {
+  busy = true; controls();
+  try { await fn(); } catch (error) { status(error.message, true); }
+  finally { busy = false; controls(); }
+}
+function render() {
+  $('count').textContent = `Импортировано: ${documents.size}`;
+  $('documents').replaceChildren();
+  for (const doc of documents.values()) {
+    const li = document.createElement('li'), button = document.createElement('button');
+    button.textContent = `${doc.filename} · ${doc.id} · версия ${doc.revision ?? 0}`;
+    button.onclick = () => show(doc); li.append(button); $('documents').append(li);
+  }
+}
+$('key').addEventListener('input', () => {
+  connected = false; documents.clear(); render(); $('pipeline').replaceChildren(new Option('Сначала подключитесь', ''));
+  $('result').textContent = 'Здесь появится JSON.'; $('log').textContent = 'Запросов пока нет.';
+  status('Ключ изменён. Подключитесь заново.'); controls();
+});
+$('connect').onclick = () => action(async () => {
+  connected = false; $('pipeline').replaceChildren(new Option('Сначала подключитесь', ''));
+  status('Проверяем ключ…');
+  const data = await request('/api/v1/pipelines');
+  for (const p of data.pipelines) $('pipeline').append(new Option(p.name, p.id));
+  if (data.pipelines.length) $('pipeline').value = data.pipelines[0].id;
+  connected = true; show(data);
+  status(`Подключено. Доступно пайплайнов: ${data.pipelines.length}.` + (data.pipelines.length ? '' : ' Назначьте пайплайн этому ключу в OCR.'));
+});
+$('pipeline').onchange = controls;
+$('upload').onclick = () => action(async () => {
+  const file = $('file').files[0];
+  if (!file) throw new Error('Выберите файл.');
+  if (file.size > 20 * 1024 * 1024) throw new Error('Максимальный размер файла — 20 МБ.');
+  const body = new FormData(); body.append('file', file);
+  status('Документ обрабатывается. Дождитесь ответа…');
+  const data = await request(`/api/v1/pipelines/${encodeURIComponent($('pipeline').value)}/run`, { method:'POST', body });
+  show(data); status('Обработка завершена. Нажмите «Импортировать / обновить», чтобы получить документ во внешней системе.');
+});
+$('sync').onclick = () => action(async () => {
+  const incoming = new Map(); let page = 0, more;
+  do {
+    status(`Импорт: страница ${page + 1}, получено документов: ${incoming.size}…`);
+    const data = await request(`/api/v1/documents?page=${page}`);
+    for (const item of data.documents) {
+      if (!incoming.has(item.id)) {
+        const detail = await request(`/api/v1/documents/${encodeURIComponent(item.id)}`);
+        incoming.set(item.id, detail.document);
+      }
+    }
+    more = data.hasMore; page++;
+  } while (more);
+  let added = 0, updated = 0;
+  for (const [id, doc] of incoming) {
+    if (!documents.has(id)) added++;
+    else if (JSON.stringify(doc) !== JSON.stringify(documents.get(id))) updated++;
+  }
+  documents = incoming; render(); show([...documents.values()]);
+  status(`Импорт завершён. Новых: ${added}, обновлено: ${updated}, всего: ${documents.size}.` + (!documents.size ? ' Ключ видит только документы, отправленные с этим же ключом.' : ''));
+});
+$('download').onclick = () => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify([...documents.values()], null, 2)], {type:'application/json'}));
+  const link = document.createElement('a'); link.href = url; link.download = 'ocr-import.json'; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+</script>
+</html>
