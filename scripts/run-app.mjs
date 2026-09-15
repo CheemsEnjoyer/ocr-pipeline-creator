@@ -99,7 +99,7 @@ try {
   }
   if (!ready) throw new Error("Python-сервер не запустился. Проверьте сообщение выше.");
   console.log("База готова. Запускаем интерфейс…");
-  const frontend = launch(process.execPath, ["node_modules/vinext/dist/cli.js", mode, "--port", String(frontendPort), "--hostname", "127.0.0.1"], { env: { ...process.env, BACKEND_URL: process.env.BACKEND_URL || `http://127.0.0.1:${backendPort}` } });
+  const frontend = launch(process.execPath, ["node_modules/vinext/dist/cli.js", mode, "--port", String(frontendPort), "--hostname", process.env.HOST || "127.0.0.1"], { env: { ...process.env, BACKEND_URL: process.env.BACKEND_URL || `http://127.0.0.1:${backendPort}` } });
   frontend.once("error", (error) => { console.error(error.message); stop(1); });
   frontend.once("exit", (code) => { if (!stopping) stop(code || 0); });
 } catch (error) {

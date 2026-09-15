@@ -9,7 +9,7 @@ import time
 from collections import deque
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request, Response, Security
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -71,15 +71,16 @@ def initialize_admin(app, storage):
     app.state.login_throttle = LoginThrottle()
 
 
-def require_access(request: Request, credentials: HTTPAuthorizationCredentials | None = Security(bearer)):
-    path = request.url.path
-    if path in ("/api/health", "/api/auth/login"):
-        return
+def authenticate(request: Request, credentials: HTTPAuthorizationCredentials | None = Security(bearer)):
+    """Определяет, кто пришёл: администратор по сессии или ключ интеграции по заголовку.
+
+    Права здесь не проверяются: за них отвечают public, admin_only и integration_allowed,
+    объявленные рядом с самими маршрутами.
+    """
     request.state.is_admin = False
     request.state.pipeline_ids = []
     request.state.api_key_id = None
-    authorization = request.headers.get("authorization")
-    if authorization is not None:
+    if request.headers.get("authorization") is not None:
         # В заголовке принимаются только ключи интеграций; администратор входит через сессию.
         if credentials is None or len(credentials.credentials) > 512:
             raise HTTPException(401, "Некорректный API-ключ")
@@ -89,13 +90,6 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
                 raise HTTPException(401, "API-ключ недействителен или отозван")
             request.state.pipeline_ids = list(key.pipeline_ids)
             request.state.api_key_id = key.id
-        # Основной адрес интеграций — /api/v1; пути без версии разрешены для совместимости.
-        # Документы ключу доступны только через /api/v1, и только те, что он обработал сам.
-        allowed = (request.method == "GET" and (path in ("/api/pipelines", "/api/v1/pipelines", "/api/v1/documents") or re.fullmatch(r"/api/v1/documents/[^/]+", path))) or (
-            request.method == "POST" and (path in ("/api/pipeline/run", "/api/v1/pipeline/run") or re.fullmatch(r"/api(?:/v1)?/pipelines/[^/]+/run", path))
-        )
-        if not allowed:
-            raise HTTPException(403, "Этот API-ключ разрешает только работу с назначенными пайплайнами и своими документами")
         return
     cookie = request.cookies.get(COOKIE)
     if cookie and len(cookie) <= 512:
@@ -106,6 +100,34 @@ def require_access(request: Request, credentials: HTTPAuthorizationCredentials |
                 request.state.is_admin = True
                 return
     raise HTTPException(401, "Требуется вход администратора или API-ключ")
+
+
+def public():
+    """Маршрут работает без входа: состояние сервера и форма входа."""
+
+
+def admin_only(request: Request, _identity: None = Depends(authenticate)):
+    """Только интерфейс администратора: ключу интеграции такой маршрут закрыт."""
+    if not request.state.is_admin:
+        raise HTTPException(403, "Этот API-ключ разрешает только работу с назначенными пайплайнами и своими документами")
+
+
+def integration_allowed(_identity: None = Depends(authenticate)):
+    """Администратор и ключ интеграции. Свои пайплайны и документы ключу выбирают сами обработчики."""
+
+
+POLICIES = (public, admin_only, integration_allowed)
+
+
+def verify_policies(app):
+    """Маршрут без политики доступа — ошибка запуска, а не тихо открытая дверь."""
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/") or not hasattr(route, "dependant"):
+            continue
+        declared = {dependency.call for dependency in route.dependant.dependencies if dependency.call in POLICIES}
+        if len(declared) != 1:
+            raise RuntimeError(f"{path}: укажите ровно одну политику доступа — public, admin_only или integration_allowed")
 
 
 class Login(BaseModel):
@@ -133,7 +155,7 @@ def validate_settings(session, payload):
     return name, ids
 
 
-@router.post("/api/auth/login")
+@router.post("/api/auth/login", dependencies=[Depends(public)])
 def login(payload: Login, request: Request, response: Response):
     throttle = request.app.state.login_throttle
     # Проверки идут по одной: счётчик точен, а параллельные scrypt не съедают память.
@@ -157,12 +179,12 @@ def login(payload: Login, request: Request, response: Response):
     return {"status": "ok"}
 
 
-@router.get("/api/auth/session")
+@router.get("/api/auth/session", dependencies=[Depends(admin_only)])
 def current_session():
     return {"role": "admin"}
 
 
-@router.post("/api/auth/logout")
+@router.post("/api/auth/logout", dependencies=[Depends(admin_only)])
 def logout(request: Request, response: Response):
     token = request.cookies.get(COOKIE)
     if token:
@@ -172,13 +194,13 @@ def logout(request: Request, response: Response):
     return {"status": "ok"}
 
 
-@router.get("/api/keys")
+@router.get("/api/keys", dependencies=[Depends(admin_only)])
 def list_keys(request: Request):
     with request.app.state.sessions() as session:
         return {"keys": [metadata(key) for key in session.scalars(select(APIKey).order_by(APIKey.created_at.desc(), APIKey.id))]}
 
 
-@router.post("/api/keys", status_code=201)
+@router.post("/api/keys", status_code=201, dependencies=[Depends(admin_only)])
 def create_key(payload: KeySettings, request: Request):
     from datetime import datetime, timezone
     token = "ocr_" + secrets.token_urlsafe(32)
@@ -190,7 +212,7 @@ def create_key(payload: KeySettings, request: Request):
         return {"key": metadata(key), "token": token}
 
 
-@router.patch("/api/keys/{key_id}")
+@router.patch("/api/keys/{key_id}", dependencies=[Depends(admin_only)])
 def update_key(key_id: str, payload: KeySettings, request: Request):
     with request.app.state.sessions() as session:
         key = session.get(APIKey, key_id)
@@ -201,7 +223,7 @@ def update_key(key_id: str, payload: KeySettings, request: Request):
         return {"key": metadata(key)}
 
 
-@router.delete("/api/keys/{key_id}")
+@router.delete("/api/keys/{key_id}", dependencies=[Depends(admin_only)])
 def revoke_key(key_id: str, request: Request):
     from datetime import datetime, timezone
     with request.app.state.sessions() as session:

@@ -10,18 +10,39 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, update
 from sqlalchemy import text as sql
 
 from backend.access import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
-from backend.database import AdminSession, APIKey
+from backend.database import AdminSession, APIKey, Document
 from backend.main import MAX_FILE_SIZE, create_app
 from backend.processing import proxy_options
+from backend.storage import S3Storage, TemporaryFileResponse
 
 ADMIN_LOGIN = "admin"
 ADMIN_PASSWORD = "test-password-123"
 ADMIN_CREDENTIALS = {"login": ADMIN_LOGIN, "password": ADMIN_PASSWORD}
+
+
+class FakeS3Client:
+    def __init__(self):
+        self.objects = {}
+
+    def put_object(self, Bucket, Key, Body, ContentType):
+        self.objects[(Bucket, Key)] = (Body, ContentType)
+
+    def get_object(self, Bucket, Key):
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {"Body": io.BytesIO(self.objects[(Bucket, Key)][0])}
+
+    def delete_object(self, Bucket, Key):
+        self.objects.pop((Bucket, Key), None)
+
+    def close(self):
+        pass
 
 
 class APITests(unittest.TestCase):
@@ -36,6 +57,11 @@ class APITests(unittest.TestCase):
         self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_LOGIN": ADMIN_LOGIN, "OCR_ADMIN_PASSWORD": ADMIN_PASSWORD})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.s3_client = FakeS3Client()
+        self.originals = S3Storage("test-bucket", "test/originals", self.s3_client)
+        s3_factory = patch("backend.main.S3Storage.from_env", return_value=self.originals)
+        s3_factory.start()
+        self.addCleanup(s3_factory.stop)
         self.app = self.make_app()
         self.client = TestClient(self.app)
         self.client.__enter__()
@@ -227,7 +253,7 @@ class APITests(unittest.TestCase):
         failed = self.upload(b"image", "scan.png", "image/png", pipeline)
         self.assertEqual(failed.status_code, 502)
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
-        self.assertEqual(len(list((self.storage / "originals").iterdir())), 1)
+        self.assertEqual(len(self.s3_client.objects), 1)
 
     def test_health_is_public_and_hides_configuration(self):
         # health открыт без входа, поэтому адреса LiteLLM и прокси в нём не раскрываются.
@@ -510,10 +536,64 @@ class APITests(unittest.TestCase):
         source = self.client.get(f"/api/documents/{document_id}/original")
         self.assertIn("attachment", source.headers["content-disposition"])
         self.assertEqual(source.headers["x-content-type-options"], "nosniff")
-        self.assertEqual(list((self.storage / "originals").iterdir())[0].name, document_id)
+        self.assertIn(("test-bucket", f"test/originals/{document_id}"), self.s3_client.objects)
+        self.assertFalse((self.storage / "originals").exists())
         partial = self.client.get(f"/api/documents/{document_id}/original", headers={"Range": "bytes=0-6"})
         self.assertEqual(partial.status_code, 206)
         self.assertEqual(partial.content, b"<script")
+
+    def test_s3_original_survives_restart_and_temporary_copy_is_deleted(self):
+        document_id = self.upload(b"hello", "source.txt", "text/plain").json()["documentId"]
+        with self.app.state.sessions() as session:
+            self.assertEqual(session.get(Document, document_id).original_key, f"s3:test/originals/{document_id}")
+        # A prefix change must not change the key of previously saved originals.
+        self.originals.prefix = "new-prefix"
+        with self.restarted_app() as client:
+            with patch.object(self.originals, "download", wraps=self.originals.download) as download:
+                response = client.get(f"/api/documents/{document_id}/original")
+                self.assertEqual(response.content, b"hello")
+                self.assertEqual(download.call_count, 1)
+            with patch("backend.main.TemporaryFileResponse", wraps=TemporaryFileResponse) as response_class:
+                response = client.get(f"/api/documents/{document_id}/original", headers={"Range": "bytes=99-100"})
+                self.assertEqual(response.status_code, 416)
+                self.assertFalse(response_class.call_args.args[0].exists())
+
+    def test_s3_failure_does_not_create_document_or_local_file(self):
+        error = ClientError({"Error": {"Code": "AccessDenied", "Message": "secret"}}, "PutObject")
+        with patch.object(self.s3_client, "put_object", side_effect=error):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("secret", response.text)
+        self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
+        self.assertFalse((self.storage / "originals").exists())
+
+    def test_s3_object_is_removed_when_database_commit_fails(self):
+        from sqlalchemy.exc import SQLAlchemyError
+        with patch("sqlalchemy.orm.SessionTransaction.commit", side_effect=SQLAlchemyError("failed")):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.s3_client.objects, {})
+        self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
+
+    def test_missing_and_unavailable_s3_originals(self):
+        document_id = self.upload().json()["documentId"]
+        url = f"/api/documents/{document_id}/original"
+        self.s3_client.objects.clear()
+        self.assertEqual(self.client.get(url).status_code, 404)
+        error = ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+        with patch.object(self.s3_client, "get_object", side_effect=error):
+            self.assertEqual(self.client.get(url).status_code, 503)
+
+    def test_legacy_local_original_remains_readable(self):
+        document_id = self.upload(b"legacy", "old.txt", "text/plain").json()["documentId"]
+        folder = self.storage / "originals"
+        folder.mkdir()
+        (folder / document_id).write_bytes(b"legacy")
+        with self.app.state.sessions.begin() as session:
+            session.get(Document, document_id).original_key = document_id
+        response = self.client.get(f"/api/documents/{document_id}/original")
+        self.assertEqual(response.content, b"legacy")
+        self.assertTrue((folder / document_id).exists())
 
     def test_docx_text(self):
         from docx import Document

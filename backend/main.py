@@ -17,9 +17,10 @@ from sqlalchemy import false, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from .access import initialize_admin, require_access, router as access_router
+from .access import admin_only, initialize_admin, integration_allowed, public, router as access_router, verify_policies
 from .database import Base, Document, SavedPipeline, open_database, upgrade_schema
 from .processing import Pipeline, api_url, complete, extract, litellm_config, proxy_options, recognize, result_fields
+from .storage import OriginalNotFound, S3Storage, StorageError, TemporaryFileResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -71,8 +72,8 @@ def create_app(database_url=None, data_dir=None, transport=None):
     @asynccontextmanager
     async def lifespan(app):
         storage.mkdir(parents=True, exist_ok=True)
-        (storage / "originals").mkdir(exist_ok=True)
         engine, sessions = open_database(database_url)
+        originals = None
         try:
             # Idempotent: existing tables and documents are preserved on every restart.
             Base.metadata.create_all(engine)
@@ -84,13 +85,17 @@ def create_app(database_url=None, data_dir=None, transport=None):
             app.state.proxy = proxy_options()
             if app.state.proxy:
                 logger.info("Внешние запросы идут через прокси %s", app.state.proxy)
+            originals = S3Storage.from_env()
+            app.state.originals = originals
             async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15), transport=transport) as client:
                 app.state.client = client
                 yield
         finally:
             engine.dispose()
+            if originals is not None:
+                originals.close()
 
-    app = FastAPI(title="OCR Flow Studio API", lifespan=lifespan, dependencies=[Depends(require_access)])
+    app = FastAPI(title="OCR Flow Studio API", lifespan=lifespan)
     app.include_router(access_router)
 
     @app.middleware("http")
@@ -127,7 +132,12 @@ def create_app(database_url=None, data_dir=None, transport=None):
     async def file_error(_request, _error):
         return JSONResponse({"error": "Хранилище файлов недоступно. Проверьте место на диске и права на папку data."}, status_code=503)
 
-    @app.get("/api/health")
+    @app.exception_handler(StorageError)
+    async def storage_error(_request, error):
+        logger.error("S3 operation failed: %s", type(error.__cause__).__name__)
+        return JSONResponse({"error": str(error)}, status_code=404 if isinstance(error, OriginalNotFound) else 503)
+
+    @app.get("/api/health", dependencies=[Depends(public)])
     def health():
         with app.state.sessions() as session:
             session.execute(select(1))
@@ -136,8 +146,8 @@ def create_app(database_url=None, data_dir=None, transport=None):
 
     # /api/v1 — версионированный API интеграций. Пути без версии остаются для интерфейса
     # и уже подключённых систем; обработчики у них общие.
-    @app.get("/api/v1/pipelines")
-    @app.get("/api/pipelines")
+    @app.get("/api/v1/pipelines", dependencies=[Depends(integration_allowed)])
+    @app.get("/api/pipelines", dependencies=[Depends(integration_allowed)])
     def list_pipelines(request: Request):
         with app.state.sessions() as session:
             query = select(SavedPipeline).where(SavedPipeline.deleted == 0)
@@ -146,7 +156,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             rows = session.scalars(query.order_by(SavedPipeline.updated_at.desc(), SavedPipeline.id))
             return {"pipelines": [serialize_pipeline(row) for row in rows]}
 
-    @app.post("/api/pipelines", status_code=201)
+    @app.post("/api/pipelines", status_code=201, dependencies=[Depends(admin_only)])
     def create_pipeline(payload: PipelineImport):
         timestamp = now()
         with app.state.sessions() as session:
@@ -161,7 +171,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(409, "Этот ID пайплайна уже занят. Укажите другой ID.") from error
             return {"pipeline": serialize_pipeline(row)}
 
-    @app.post("/api/pipelines/import")
+    @app.post("/api/pipelines/import", dependencies=[Depends(admin_only)])
     def import_pipelines(payload: list[PipelineImport]):
         # Import legacy browser configurations only once; never overwrite server edits
         # or resurrect a pipeline deleted from another browser.
@@ -174,7 +184,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             session.commit()
         return {"status": "ok"}
 
-    @app.patch("/api/pipelines/{pipeline_id}")
+    @app.patch("/api/pipelines/{pipeline_id}", dependencies=[Depends(admin_only)])
     def update_pipeline(pipeline_id: str, payload: PipelineUpdate):
         with app.state.sessions() as session:
             row = session.get(SavedPipeline, pipeline_id)
@@ -187,7 +197,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             session.commit()
             return {"pipeline": serialize_pipeline(row)}
 
-    @app.delete("/api/pipelines/{pipeline_id}")
+    @app.delete("/api/pipelines/{pipeline_id}", dependencies=[Depends(admin_only)])
     def remove_pipeline(pipeline_id: str):
         with app.state.sessions() as session:
             row = session.get(SavedPipeline, pipeline_id)
@@ -204,15 +214,15 @@ def create_app(database_url=None, data_dir=None, transport=None):
             return query
         return query.where(Document.api_key_id == request.state.api_key_id) if request.state.api_key_id else query.where(false())
 
-    @app.get("/api/v1/documents")
-    @app.get("/api/documents")
+    @app.get("/api/v1/documents", dependencies=[Depends(integration_allowed)])
+    @app.get("/api/documents", dependencies=[Depends(admin_only)])
     def documents(request: Request, page: int = Query(default=0, ge=0)):
         with app.state.sessions() as session:
             rows = session.scalars(visible_documents(request).order_by(Document.created_at.desc(), Document.id.desc()).offset(page * 50).limit(51)).all()
             return {"documents": [serialize(row) for row in rows[:50]], "hasMore": len(rows) > 50}
 
-    @app.get("/api/v1/documents/{document_id}")
-    @app.get("/api/documents/{document_id}")
+    @app.get("/api/v1/documents/{document_id}", dependencies=[Depends(integration_allowed)])
+    @app.get("/api/documents/{document_id}", dependencies=[Depends(admin_only)])
     def document(document_id: str, request: Request):
         with app.state.sessions() as session:
             row = session.scalar(visible_documents(request).where(Document.id == document_id))
@@ -220,7 +230,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(404, "Документ не найден")
             return {"document": serialize(row, detail=True)}
 
-    @app.patch("/api/documents/{document_id}")
+    @app.patch("/api/documents/{document_id}", dependencies=[Depends(admin_only)])
     def update_fields(document_id: str, payload: FieldUpdate):
         if len(json.dumps(payload.fields, ensure_ascii=False)) > 1_000_000:
             raise HTTPException(400, "Поля документа слишком большие")
@@ -233,28 +243,36 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(409, "Документ изменился в другой вкладке. Откройте его заново перед сохранением.")
         return {"revision": payload.revision + 1, "updated_at": timestamp}
 
-    @app.get("/api/documents/{document_id}/original")
+    @app.get("/api/documents/{document_id}/original", dependencies=[Depends(admin_only)])
     def original(document_id: str, request: Request):
         with app.state.sessions() as session:
             row = session.get(Document, document_id)
             if row is None:
                 raise HTTPException(404, "Документ не найден")
-            path = (storage / "originals" / row.original_key).resolve()
-            if not path.is_relative_to(storage / "originals") or not path.is_file():
-                raise HTTPException(404, "Исходный файл не найден")
             inline = re.fullmatch(r"application/pdf|image/(png|jpeg|gif|webp|avif|bmp)", row.mime_type) and "download" not in request.query_params
-            return FileResponse(path, filename=row.filename, media_type=row.mime_type, content_disposition_type="inline" if inline else "attachment", headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
+            if row.original_key.startswith("s3:"):
+                path = app.state.originals.download(row.original_key)
+                response_type = TemporaryFileResponse
+            else:
+                # Existing local originals remain readable; all new uploads go to S3.
+                path = (storage / "originals" / row.original_key).resolve()
+                if not path.is_relative_to(storage / "originals") or not path.is_file():
+                    raise HTTPException(404, "Исходный файл не найден")
+                response_type = FileResponse
+            return response_type(path, filename=row.filename, media_type=row.mime_type, content_disposition_type="inline" if inline else "attachment", headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
 
     def persist(content, filename, mime, pipeline_name, text, result, pipeline_id=None, api_key_id=None, plain_text=False):
         document_id = str(uuid4())
-        path = storage / "originals" / document_id
+        original_key = app.state.originals.put(document_id, content, mime)
         try:
-            path.write_bytes(content)
             timestamp = now()
             with app.state.sessions.begin() as session:
-                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=document_id, text=text, result=result, fields={} if plain_text else result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id))
+                session.add(Document(id=document_id, filename=filename, mime_type=mime, size=len(content), pipeline_name=pipeline_name, original_key=original_key, text=text, result=result, fields={} if plain_text else result_fields(result), created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id))
         except Exception:
-            path.unlink(missing_ok=True)
+            try:
+                app.state.originals.delete(original_key)
+            except StorageError:
+                logger.error("Не удалось удалить объект S3 после ошибки записи в базу: %s", original_key)
             raise
         return document_id
 
@@ -267,14 +285,14 @@ def create_app(database_url=None, data_dir=None, transport=None):
                 raise HTTPException(404, "Пайплайн не найден")
             return Pipeline.model_validate(row.config)
 
-    @app.post("/api/v1/pipelines/{pipeline_id}/run")
-    @app.post("/api/pipelines/{pipeline_id}/run")
+    @app.post("/api/v1/pipelines/{pipeline_id}/run", dependencies=[Depends(integration_allowed)])
+    @app.post("/api/pipelines/{pipeline_id}/run", dependencies=[Depends(integration_allowed)])
     async def run_saved_pipeline(pipeline_id: str, request: Request, file: UploadFile = File()):
         parsed = await run_in_threadpool(stored_pipeline, pipeline_id, request)
         return await process_file(file, parsed, request, pipeline_id)
 
-    @app.post("/api/v1/pipeline/run")
-    @app.post("/api/pipeline/run")
+    @app.post("/api/v1/pipeline/run", dependencies=[Depends(integration_allowed)])
+    @app.post("/api/pipeline/run", dependencies=[Depends(integration_allowed)])
     async def run_pipeline(request: Request, file: UploadFile = File(), pipeline: str | None = Form(default=None), pipeline_id: str | None = Form(default=None)):
         if pipeline is not None and not request.state.is_admin:
             raise HTTPException(403, "Передайте pipeline_id: ключ интеграции не может менять конфигурацию")
@@ -305,7 +323,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         document_id = await run_in_threadpool(persist, content, filename, mime, parsed.name, text, result, pipeline_id, request.state.api_key_id, bool(parsed.extraction and parsed.extraction.mode == "prompt"))
         return {"file": filename, "text": text, "result": result, "documentId": document_id}
 
-    @app.get("/api/litellm/models")
+    @app.get("/api/litellm/models", dependencies=[Depends(admin_only)])
     async def models():
         base, headers = litellm_config()
         response = await app.state.client.get(api_url(base, "models"), headers=headers)
@@ -317,7 +335,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         except (ValueError, TypeError, AttributeError) as error:
             raise HTTPException(502, "LiteLLM вернул некорректный список моделей") from error
 
-    @app.post("/api/litellm/chat")
+    @app.post("/api/litellm/chat", dependencies=[Depends(admin_only)])
     async def chat(payload: ChatRequest):
         schema = {field.get("name", ""): {"type": "string", "description": field.get("description", "")} for field in payload.fields}
         result = await complete(app.state.client, {
@@ -330,6 +348,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         })
         return {"model": payload.model, "result": result}
 
+    verify_policies(app)
     return app
 
 
