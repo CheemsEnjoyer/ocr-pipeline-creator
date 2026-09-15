@@ -4,7 +4,6 @@ import os
 import tempfile
 import unittest
 from uuid import uuid4
-from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -16,10 +15,15 @@ from sqlalchemy import create_engine, inspect, select, update
 from sqlalchemy import text as sql
 
 from backend.access import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
-from backend.database import AdminSession, APIKey, Document
+from backend.database import AdminSession, APIKey, Document, ProcessingJob, configured_database_url, open_database
+from sqlalchemy.schema import CreateSchema, DropSchema
 from backend.main import MAX_FILE_SIZE, create_app
 from backend.processing import proxy_options
 from backend.storage import S3Storage, TemporaryFileResponse
+from backend.tasks import execute_job
+from backend.config import JobSettings
+from backend.dispatcher import dispatch_once
+from backend.models import LoginGuard, TaskOutbox
 
 ADMIN_LOGIN = "admin"
 ADMIN_PASSWORD = "test-password-123"
@@ -50,11 +54,11 @@ class APITests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.storage = Path(self.temporary.name)
-        self.database_url = f"sqlite:///{(self.storage / 'test.sqlite3').as_posix()}"
+        self.database_url = self.database_for(self.storage)
         self.calls = []
         self.fail_upstream = False
         self.refuse_upstream = False
-        self.environment = patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_LOGIN": ADMIN_LOGIN, "OCR_ADMIN_PASSWORD": ADMIN_PASSWORD})
+        self.environment = patch.dict("os.environ", {"AUTH_PROVIDER": "local", "LITELLM_BASE_URL": "http://litellm.test/v1", "LITELLM_API_KEY": "test-key", "OCR_ADMIN_LOGIN": ADMIN_LOGIN, "OCR_ADMIN_PASSWORD": ADMIN_PASSWORD})
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.s3_client = FakeS3Client()
@@ -80,10 +84,33 @@ class APITests(unittest.TestCase):
             return httpx.Response(200, json={"page_content": "Распознанный текст"})
         body = json.loads(request.content)
         content = "Распознанный текст" if body["model"] == "vision" else '{"total": 1500, "verified": false}'
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+        if body.get("response_format", {}).get("type") == "json_schema":
+            properties = body["response_format"]["json_schema"]["schema"]["properties"]
+            content = json.dumps({name: "1500" if name == "total" else None for name in properties})
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
 
     def make_app(self):
         return create_app(self.database_url, self.storage, httpx.MockTransport(self.upstream))
+
+    def database_for(self, storage):
+        target = os.getenv("TEST_DATABASE_URL")
+        if not target:
+            return f"sqlite:///{(storage / 'test.sqlite3').as_posix()}"
+        # Each test owns a schema; no application or other test data is modified.
+        engine, _ = open_database(target)
+        schema = "ocr_test_" + uuid4().hex
+        with engine.begin() as connection:
+            connection.execute(CreateSchema(schema))
+
+        def cleanup():
+            try:
+                with engine.begin() as connection:
+                    connection.execute(DropSchema(schema, cascade=True))
+            finally:
+                engine.dispose()
+
+        self.addCleanup(cleanup)
+        return engine.url.update_query_dict({"options": f"-csearch_path={schema}"})
 
     def sign_in(self, client):
         response = client.post("/api/auth/login", json=ADMIN_CREDENTIALS)
@@ -185,12 +212,17 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["text"], "Распознанный текст")
         row = self.client.get(f"/api/documents/{response.json()['documentId']}").json()["document"]
-        self.assertEqual(row["fields"], {"total": 1500, "verified": False})
+        self.assertEqual(row["fields"], {"total": "1500"})
         self.assertTrue(all(call.headers.get("authorization") == "Bearer test-key" for call in self.calls))
         self.assertEqual(self.calls[0].url.path, "/v1/chat/completions")
         self.assertTrue(json.loads(self.calls[0].content)["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertEqual(json.loads(self.calls[1].content)["messages"][1]["content"], "Распознанный текст")
-        self.assertEqual(json.loads(self.calls[1].content)["response_format"], {"type": "json_object"})
+        self.assertEqual(json.loads(self.calls[1].content)["response_format"], {
+            "type": "json_schema", "json_schema": {"name": "document_fields", "strict": True, "schema": {
+                "type": "object", "properties": {"total": {"type": ["string", "null"], "description": "Сумма"}},
+                "required": ["total"], "additionalProperties": False,
+            }},
+        })
 
     def test_pipeline_temperatures(self):
         for temperatures in ({}, {"ocr": 0.3, "extraction": 0.8}, {"ocr": 0, "extraction": 2}):
@@ -304,7 +336,9 @@ class APITests(unittest.TestCase):
             # В базе нет ни токена сессии, ни пароля в открытом виде.
             self.assertNotIn(token, [row.token_hash for row in rows])
             self.assertFalse(any(ADMIN_PASSWORD in row.admin_hash for row in rows))
-        self.assertEqual(browser.get("/api/auth/session").json(), {"role": "admin"})
+        identity = browser.get("/api/auth/session").json()
+        self.assertEqual(identity["role"], "admin")
+        self.assertEqual(identity["login"], ADMIN_LOGIN)
         self.assertEqual(browser.get("/api/documents").status_code, 200)
         with self.app.state.sessions.begin() as session:
             session.execute(update(AdminSession).values(expires_at=0))
@@ -318,7 +352,7 @@ class APITests(unittest.TestCase):
 
     def test_admin_password_is_generated_once_when_not_configured(self):
         storage = self.storage / "fresh"
-        database = f"sqlite:///{(storage / 'fresh.sqlite3').as_posix()}"
+        database = self.database_for(storage)
         with patch.dict("os.environ", {"OCR_ADMIN_LOGIN": "", "OCR_ADMIN_PASSWORD": ""}):
             with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as first:
                 password = (storage / "admin-password.txt").read_text(encoding="utf-8").strip()
@@ -349,10 +383,12 @@ class APITests(unittest.TestCase):
         self.assertEqual(locked.status_code, 429)
         self.assertIn("Повторите через 10 мин", locked.json()["error"])
         # Окно прошло — верный пароль снова работает, а счётчик сбрасывается.
-        throttle = self.app.state.login_throttle
-        throttle.failures = deque(moment - FAILED_LOGIN_WINDOW for moment in throttle.failures)
+        with self.app.state.sessions.begin() as session:
+            guard = session.get(LoginGuard, "admin")
+            guard.failures = [moment - FAILED_LOGIN_WINDOW for moment in guard.failures]
         self.assertEqual(browser.post("/api/auth/login", json=ADMIN_CREDENTIALS).status_code, 200)
-        self.assertEqual(len(throttle.failures), 0)
+        with self.app.state.sessions() as session:
+            self.assertEqual(session.get(LoginGuard, "admin").failures, [])
 
     def test_integration_key_is_limited_to_assigned_pipelines(self):
         allowed = self.create_pipeline("Счета")
@@ -455,7 +491,7 @@ class APITests(unittest.TestCase):
     def test_existing_documents_table_is_upgraded(self):
         storage = self.storage / "legacy"
         storage.mkdir()
-        database = f"sqlite:///{(storage / 'legacy.sqlite3').as_posix()}"
+        database = self.database_for(storage)
         engine = create_engine(database)
         with engine.begin() as connection:
             # Схема таблицы документов до появления pipeline_id и api_key_id.
@@ -553,7 +589,7 @@ class APITests(unittest.TestCase):
                 response = client.get(f"/api/documents/{document_id}/original")
                 self.assertEqual(response.content, b"hello")
                 self.assertEqual(download.call_count, 1)
-            with patch("backend.main.TemporaryFileResponse", wraps=TemporaryFileResponse) as response_class:
+            with patch("backend.api.documents.TemporaryFileResponse", wraps=TemporaryFileResponse) as response_class:
                 response = client.get(f"/api/documents/{document_id}/original", headers={"Range": "bytes=99-100"})
                 self.assertEqual(response.status_code, 416)
                 self.assertFalse(response_class.call_args.args[0].exists())
@@ -604,6 +640,468 @@ class APITests(unittest.TestCase):
         response = self.upload(buf.getvalue(), "contract.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("Договор номер 15", response.json()["text"])
+
+    def submit_background(self, content=b"background text", pipeline=None):
+        response = self.client.post("/api/pipeline/run?background=true", files={"file": ("test.txt", content, "text/plain")}, data={"pipeline": json.dumps(pipeline or {"source": "document"})})
+        self.assertEqual(response.status_code, 202, response.text)
+        with self.app.state.sessions() as session:
+            event = session.scalar(select(TaskOutbox).where(TaskOutbox.job_id == response.json()["taskId"]))
+            self.assertIsNotNone(event)
+        return response.json()
+
+    def execute_background(self, job_id):
+        execute_job(job_id, self.app.state.sessions, self.originals, httpx.MockTransport(self.upstream), settings=JobSettings(max_attempts=1))
+
+    def test_background_processing_and_redelivery_do_not_duplicate_documents(self):
+        job = self.submit_background(pipeline={"source": "document", "extraction": {"mode": "fields", "model": "extract", "fields": [{"name": "total"}, {"name": "missing"}]}})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "queued")
+        self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
+        self.execute_background(job["taskId"])
+        self.execute_background(job["taskId"])
+        status = self.client.get(job["statusUrl"]).json()
+        self.assertEqual((status["status"], status["text"], status["documentId"]), ("succeeded", "background text", job["taskId"]))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
+        document = self.client.get(f"/api/documents/{job['taskId']}").json()["document"]
+        self.assertEqual(document["fields"], {"total": "1500", "missing": None})
+        self.assertEqual(self.client.get(f"/api/documents/{job['taskId']}/original").content, b"background text")
+        with self.restarted_app() as client:
+            self.assertEqual(client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    def test_background_failure_is_reported_and_can_be_retried(self):
+        job = self.submit_background(pipeline={"source": "document", "extraction": {"mode": "prompt", "model": "extract"}})
+        self.fail_upstream = True
+        self.execute_background(job["taskId"])
+        status = self.client.get(job["statusUrl"]).json()
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("LiteLLM", status["error"])
+        self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
+        self.fail_upstream = False
+        self.assertEqual(self.client.post(job["statusUrl"] + "/retry").status_code, 202)
+        self.execute_background(job["taskId"])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+        self.assertEqual(self.client.post(job["statusUrl"] + "/retry").status_code, 409)
+
+    def test_invalid_structured_output_is_not_saved_synchronously_or_by_worker(self):
+        pipeline = {"source": "document", "extraction": {"mode": "fields", "model": "extract", "fields": [{"name": "total"}]}}
+        invalid = '{"total":1500,"extra":"unrequested"}'
+        with patch("backend.processing.complete", return_value=invalid):
+            response = self.upload(pipeline=pipeline)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(self.s3_client.objects, {})
+        job = self.submit_background(pipeline=pipeline)
+        with patch("backend.processing.complete", return_value=invalid):
+            self.execute_background(job["taskId"])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "failed")
+        self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
+
+    def test_background_jobs_are_private_to_their_api_key(self):
+        pipeline = self.create_pipeline("Счета")
+        first = self.client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [pipeline]}).json()
+        second = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [pipeline]}).json()
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + first["token"]})
+        other = TestClient(self.app, headers={"Authorization": "Bearer " + second["token"]})
+        response = self.send_document(integration, f"/api/v1/pipelines/{pipeline}/run?background=true")
+        self.assertEqual(response.status_code, 202)
+        job = response.json()
+        self.assertTrue(job["statusUrl"].startswith("/api/v1/jobs/"))
+        self.assertEqual(other.get(job["statusUrl"]).status_code, 404)
+        self.assertEqual(other.post(job["statusUrl"] + "/retry").status_code, 404)
+        self.assertEqual(TestClient(self.app).get(job["statusUrl"]).status_code, 401)
+        replacement = self.create_pipeline("Другой")
+        self.client.patch(f"/api/keys/{first['key']['id']}", json={"name": "ERP", "pipeline_ids": [replacement]})
+        self.assertEqual(integration.post(job["statusUrl"] + "/retry").status_code, 403)
+        self.execute_background(job["taskId"])
+        self.assertEqual(integration.get(job["statusUrl"]).json()["status"], "succeeded")
+        own = integration.get("/api/v1/documents").json()["documents"]
+        self.assertEqual([row["id"] for row in own], [job["taskId"]])
+        self.client.delete(f"/api/keys/{first['key']['id']}")
+        self.assertEqual(integration.get(job["statusUrl"]).status_code, 401)
+
+    def test_publish_failure_preserves_task_id_and_original_for_recovery(self):
+        job = self.submit_background(b"recover")
+        publisher = lambda *_: (_ for _ in ()).throw(ConnectionError("redis down"))
+        self.assertEqual(dispatch_once(self.app.state.sessions, publisher=publisher), 0)
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "queued")
+        with self.app.state.sessions.begin() as session:
+            event = session.scalar(select(TaskOutbox).where(TaskOutbox.job_id == job["taskId"]))
+            self.assertIsNone(event.published_at)
+            event.next_attempt_at = 0
+        published = []
+        self.assertEqual(dispatch_once(self.app.state.sessions, publisher=lambda *args: published.append(args)), 1)
+        self.assertEqual(published[0][0], job["taskId"])
+        self.execute_background(job["taskId"])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["text"], "recover")
+
+    def test_background_persistence_failure_cleans_s3_and_does_not_publish(self):
+        from sqlalchemy.exc import SQLAlchemyError
+        with patch("sqlalchemy.orm.SessionTransaction.commit", side_effect=SQLAlchemyError("failed")):
+            response = self.client.post("/api/pipeline/run?background=true", files={"file": ("test.txt", b"test", "text/plain")}, data={"pipeline": '{"source":"document"}'})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.s3_client.objects, {})
+        with self.app.state.sessions() as session:
+            self.assertEqual(list(session.scalars(select(TaskOutbox))), [])
+
+    @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for concurrency test")
+    def test_concurrent_worker_deliveries_are_serialized(self):
+        from concurrent.futures import ThreadPoolExecutor
+        job = self.submit_background(pipeline={"source": "document", "extraction": {"mode": "fields", "model": "extract", "fields": [{"name": "total"}]}})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(self.execute_background, [job["taskId"], job["taskId"]]))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
+
+    def test_redelivery_recovers_a_job_left_processing_by_a_lost_worker(self):
+        job = self.submit_background()
+        with self.app.state.sessions.begin() as session:
+            session.get(ProcessingJob, job["taskId"]).status = "processing"
+        self.execute_background(job["taskId"])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for real worker test")
+    def test_real_celery_worker_processes_a_queued_document(self):
+        import time
+        from celery import Celery
+        from celery.contrib.testing.worker import start_worker
+        from backend.tasks import process_document
+        test_celery = Celery("ocr_test", broker="memory://")
+        test_celery.conf.update(task_ignore_result=True, task_serializer="json", accept_content=["json"])
+        task = test_celery.task(process_document.run, name="ocr.process_document")
+        job = self.submit_background()
+        url = self.database_url.render_as_string(hide_password=False)
+        with patch.dict("os.environ", {"DATABASE_URL": url}), start_worker(test_celery, pool="solo", perform_ping_check=False, loglevel="WARNING"):
+            task.apply_async(args=[job["taskId"]])
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                status = self.client.get(job["statusUrl"]).json()
+                if status["status"] in {"succeeded", "failed"}:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status["status"], "succeeded", status)
+            self.assertEqual(status["text"], "background text")
+        test_celery.close()
+
+    def test_outbox_survives_api_restart_without_publication(self):
+        job = self.submit_background()
+        with self.restarted_app() as client:
+            sent = []
+            self.assertEqual(dispatch_once(self.app.state.sessions, publisher=lambda *args: sent.append(args)), 1)
+            self.assertEqual(sent[0][:2], (job["taskId"], 0))
+            self.execute_background(job["taskId"])
+            self.assertEqual(client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    def test_outbox_recovers_lost_dispatcher_and_fences_stale_receipts(self):
+        import time
+        from backend.repositories import OutboxRepository
+        job = self.submit_background()
+        repository = OutboxRepository(self.app.state.sessions, JobSettings())
+        first = repository.claim()
+        self.assertIsNone(repository.claim())
+        second = repository.claim(clock=time.time() + 31)
+        self.assertEqual(second.id, first.id)
+        repository.finish(first, True)
+        with self.app.state.sessions() as session:
+            self.assertIsNone(session.get(TaskOutbox, first.id).published_at)
+        repository.finish(second, True)
+
+    def test_worker_lease_prevents_parallel_claim_and_stale_completion(self):
+        import time
+        from backend.repositories import JobRepository
+        from backend.services import build_document
+        from backend.processing import Pipeline
+        job = self.submit_background()
+        repository = JobRepository(self.app.state.sessions, JobSettings())
+        first = repository.claim(job["taskId"], clock=time.time() - 301)
+        second = repository.claim(job["taskId"])
+        self.assertIsNotNone(second)
+        self.assertIsNone(repository.claim(job["taskId"]))
+        def document(claimed):
+            return build_document(claimed.id, claimed.original_key, claimed.filename, claimed.mime_type, claimed.size, Pipeline.model_validate(claimed.pipeline), "text", "text", claimed.pipeline_id, claimed.api_key_id)
+        self.assertFalse(repository.complete(first, document(first)))
+        self.assertTrue(repository.complete(second, document(second)))
+        self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
+
+    def test_expired_worker_is_requeued_and_old_generation_is_ignored(self):
+        import time
+        from backend.repositories import JobRepository, OutboxRepository
+        job = self.submit_background()
+        repository = JobRepository(self.app.state.sessions, JobSettings())
+        old = repository.claim(job["taskId"], clock=time.time() - 301)
+        OutboxRepository(self.app.state.sessions, JobSettings()).recover()
+        self.assertIsNone(repository.claim(job["taskId"], generation=old.generation))
+        with self.app.state.sessions() as session:
+            row = session.get(ProcessingJob, job["taskId"])
+            self.assertEqual((row.status, row.generation), ("queued", 1))
+            self.assertEqual(len(list(session.scalars(select(TaskOutbox).where(TaskOutbox.job_id == row.id)))), 2)
+        execute_job(job["taskId"], self.app.state.sessions, self.originals, httpx.MockTransport(self.upstream), generation=1)
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    def test_temporary_model_failure_retries_with_backoff_then_succeeds(self):
+        import time
+        pipeline = {"source": "document", "extraction": {"mode": "prompt", "model": "extract"}}
+        job = self.submit_background(pipeline=pipeline)
+        self.fail_upstream = True
+        execute_job(job["taskId"], self.app.state.sessions, self.originals, httpx.MockTransport(self.upstream))
+        with self.app.state.sessions.begin() as session:
+            row = session.get(ProcessingJob, job["taskId"])
+            self.assertEqual((row.status, row.attempts, row.generation), ("queued", 1, 1))
+            self.assertGreater(row.next_run_at, time.time())
+            row.next_run_at = 0
+        self.fail_upstream = False
+        execute_job(job["taskId"], self.app.state.sessions, self.originals, httpx.MockTransport(self.upstream), generation=1)
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    def test_attempt_budget_and_deadline_stop_automatic_retries(self):
+        import time
+        job = self.submit_background(pipeline={"source": "document", "extraction": {"mode": "prompt", "model": "extract"}})
+        self.fail_upstream = True
+        for _ in range(3):
+            with self.app.state.sessions.begin() as session:
+                session.get(ProcessingJob, job["taskId"]).next_run_at = 0
+            execute_job(job["taskId"], self.app.state.sessions, self.originals, httpx.MockTransport(self.upstream))
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "failed")
+        expired = self.submit_background()
+        with self.app.state.sessions.begin() as session:
+            row = session.get(ProcessingJob, expired["taskId"])
+            row.status, row.deadline_at, row.lease_until = "processing", time.time() - 1, time.time() + 100
+        from backend.repositories import OutboxRepository
+        OutboxRepository(self.app.state.sessions, JobSettings()).recover()
+        self.assertEqual(self.client.get(expired["statusUrl"]).json()["status"], "failed")
+
+    def test_model_io_occurs_without_database_transaction(self):
+        from sqlalchemy import event
+        engine = self.app.state.sessions.kw["bind"]
+        active = [0]
+        def begin(_):
+            active[0] += 1
+        def end(_):
+            active[0] -= 1
+        for name, callback in (("begin", begin), ("commit", end), ("rollback", end)):
+            event.listen(engine, name, callback)
+            self.addCleanup(event.remove, engine, name, callback)
+        job = self.submit_background()
+        async def process(*args):
+            self.assertEqual(active[0], 0)
+            return "text", "text"
+        with patch("backend.services.process_pipeline", side_effect=process):
+            self.execute_background(job["taskId"])
+        self.assertEqual(active[0], 0)
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+
+    def test_throttle_is_shared_with_a_second_api_instance_and_restart(self):
+        browser = TestClient(self.app)
+        for _ in range(MAX_FAILED_LOGINS):
+            browser.post("/api/auth/login", json={"login": ADMIN_LOGIN, "password": "wrong-password"})
+        with TestClient(self.make_app()) as other:
+            response = other.post("/api/auth/login", json=ADMIN_CREDENTIALS)
+            self.assertEqual(response.status_code, 429)
+
+    def test_sync_timeout_returns_gateway_timeout_without_persistence(self):
+        import asyncio
+        self.app.state.processing.settings = JobSettings(timeout=1)
+        async def slow(*args):
+            await asyncio.sleep(5)
+        with patch("backend.services.recognize", side_effect=slow):
+            response = self.upload()
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(self.s3_client.objects, {})
+
+    def test_proxy_credentials_are_hidden_in_responses_and_logs(self):
+        self.refuse_upstream = True
+        self.app.state.proxy = "http://proxy-user:proxy-password@proxy.local:8080"
+        with self.assertLogs("ocr", level="WARNING") as logs:
+            response = self.upload(b"image", "scan.png", "image/png", {"source": "scans", "ocr": {"provider": "litellm", "model": "vision"}})
+        combined = response.text + "\n".join(logs.output)
+        self.assertIn("proxy.local:8080", combined)
+        self.assertNotIn("proxy-user", combined)
+        self.assertNotIn("proxy-password", combined)
+
+
+    @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for JSONB migration")
+    def test_jsonb_migration_preserves_existing_values_and_supports_rollback(self):
+        from alembic import command
+        from alembic.config import Config
+        from sqlalchemy.dialects.postgresql import JSONB, JSON
+        from backend.migrate import migrate
+        columns = [("documents", "fields"), ("processing_jobs", "pipeline"), ("pipelines", "config"), ("api_keys", "pipeline_ids"), ("login_guard", "failures")]
+        payload = {"id":"jsonb_test", "name":"JSONB тест", "source":"document"}
+        self.assertEqual(self.client.post("/api/pipelines", json=payload).status_code, 201)
+        self.assertEqual(self.client.post("/api/keys", json={"name":"JSONB key", "pipeline_ids":["jsonb_test"]}).status_code, 201)
+        self.assertEqual(self.upload(b'{"nested":{"amount":1500,"items":[true,null,"text"]}}').status_code, 200)
+        self.submit_background(pipeline={"name":"JSONB задача", "source":"document"})
+        self.client.post("/api/auth/login", json={"login":"wrong", "password":"wrong"})
+        engine = self.app.state.sessions.kw["bind"]
+
+        def snapshot():
+            with engine.connect() as connection:
+                return {table:connection.execute(sql(f"SELECT {column} FROM {table} ORDER BY {column}::text")).scalars().all() for table, column in columns}
+
+        def assert_types(expected):
+            for table, column in columns:
+                actual = next(item["type"] for item in inspect(engine).get_columns(table) if item["name"] == column)
+                self.assertIsInstance(actual, expected)
+
+        before = snapshot()
+        assert_types(JSONB)
+        config = Config()
+        config.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "migrations"))
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0002_reliable_jobs")
+        assert_types(JSON)
+        self.assertEqual(snapshot(), before)
+        migrate(engine)
+        assert_types(JSONB)
+        self.assertEqual(snapshot(), before)
+
+    def test_history_pipeline_filter_paginates_and_preserves_deleted_history(self):
+        for pipeline_id in ("first", "second", "all"):
+            self.assertEqual(self.client.post("/api/pipelines", json={"id":pipeline_id, "name":"Same name", "source":"document"}).status_code, 201)
+        first = self.client.post("/api/pipelines/first/run", files={"file":("first.txt", b"first", "text/plain")}).json()["documentId"]
+        self.client.post("/api/pipelines/second/run", files={"file":("second.txt", b"second", "text/plain")})
+        self.upload(b"Without pipeline", "test.txt", "text/plain")
+        with self.app.state.sessions.begin() as session:
+            original = session.get(Document, first)
+            values = {column.name:getattr(original, column.name) for column in Document.__table__.columns if column.name != "id"}
+            session.add_all([Document(id=str(uuid4()), **values) for _ in range(50)])
+        page = self.client.get("/api/documents?pipeline_id=first").json()
+        self.assertEqual(len(page["documents"]), 50)
+        self.assertTrue(page["hasMore"])
+        self.assertTrue(all(row["pipeline_id"] == "first" for row in page["documents"]))
+        last = self.client.get("/api/documents?pipeline_id=first&page=1").json()
+        self.assertEqual(len(last["documents"]), 1)
+        self.assertFalse(last["hasMore"])
+        self.assertFalse({row["id"] for row in page["documents"]} & {row["id"] for row in last["documents"]})
+        self.assertEqual(len(self.client.get("/api/documents?pipeline_id=second").json()["documents"]), 1)
+        self.assertEqual(self.client.get("/api/documents?pipeline_id=unknown").json()["documents"], [])
+        self.assertEqual(self.client.get("/api/documents?pipeline_id=all").json()["documents"], [])
+        self.client.delete("/api/pipelines/first")
+        choices = self.client.get("/api/history/pipelines").json()["pipelines"]
+        self.assertEqual({row["id"] for row in choices}, {"first", "second", "all"})
+        self.assertTrue(next(row for row in choices if row["id"] == "first")["deleted"])
+        self.assertEqual(len(self.client.get("/api/documents?pipeline_id=first").json()["documents"]), 50)
+
+    def test_history_pipeline_filter_keeps_integration_ownership(self):
+        self.client.post("/api/pipelines", json={"id":"owned", "name":"Owned", "source":"document"})
+        self.client.post("/api/pipelines/owned/run", files={"file":("admin.txt", b"Admin document", "text/plain")})
+        token = self.client.post("/api/keys", json={"name":"Integration", "pipeline_ids":["owned"]}).json()["token"]
+        self.client.cookies.clear()
+        headers = {"Authorization":f"Bearer {token}"}
+        uploaded = self.client.post("/api/v1/pipelines/owned/run", headers=headers, files={"file":("owned.txt", b"Own document", "text/plain")})
+        self.assertEqual(uploaded.status_code, 200)
+        rows = self.client.get("/api/v1/documents?pipeline_id=owned", headers=headers).json()["documents"]
+        self.assertEqual([row["id"] for row in rows], [uploaded.json()["documentId"]])
+        self.assertEqual(self.client.get("/api/history/pipelines", headers=headers).status_code, 403)
+
+    def test_background_status_links_match_api_prefix(self):
+        for prefix in ("/api", "/api/v1"):
+            response = self.client.post(f"{prefix}/pipeline/run?background=true", files={"file":("test.txt", b"Test", "text/plain")}, data={"pipeline":'{"source":"document"}'})
+            self.assertEqual(response.status_code, 202, response.text)
+            job = response.json()
+            self.assertEqual(job["statusUrl"], f"{prefix}/jobs/{job['taskId']}")
+            self.assertEqual(response.headers["Location"], job["statusUrl"])
+            self.assertEqual(self.client.get(job["statusUrl"]).status_code, 200)
+
+    def test_migrated_schema_matches_models(self):
+        from alembic.autogenerate import compare_metadata
+        from alembic.migration import MigrationContext
+        from backend.models import Base
+        with self.app.state.sessions.kw["bind"].connect() as connection:
+            context = MigrationContext.configure(connection, opts={"compare_type": True})
+            self.assertEqual(compare_metadata(context, Base.metadata), [])
+
+    def test_combined_processing_settings_survive_edit_and_run(self):
+        config = {"id":"combined", "name":"Combined", "source":"document", "extraction":{"model":"extract", "prompt_enabled":True, "fields_enabled":True, "prompt":"Use the final total", "fields":[{"name":"total"}]}}
+        response = self.client.post("/api/pipelines", json=config)
+        self.assertEqual(response.status_code, 201, response.text)
+        saved = response.json()["pipeline"]
+        result = self.upload(b"Total 1500", "test.txt", "text/plain", saved)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(json.loads(result.json()["result"]), {"total":"1500"})
+        self.assertIn("Use the final total", json.loads(self.calls[-1].content)["messages"][0]["content"])
+        saved["extraction"].update(prompt_enabled=False, fields_enabled=False)
+        changed = self.client.patch("/api/pipelines/combined", json=saved)
+        self.assertEqual(changed.status_code, 200, changed.text)
+        with self.restarted_app() as restarted:
+            stored = restarted.get("/api/pipelines").json()["pipelines"][0]
+            self.assertFalse(stored["extraction"]["prompt_enabled"])
+            self.assertFalse(stored["extraction"]["fields_enabled"])
+            self.assertEqual(stored["extraction"]["prompt"], "Use the final total")
+            self.assertEqual(stored["extraction"]["fields"], [{"name":"total", "description":""}])
+        before = len(self.calls)
+        job = self.submit_background(pipeline=stored)
+        self.execute_background(job["taskId"])
+        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+        self.assertEqual(len(self.calls), before)
+
+    def test_disabled_ocr_reads_text_without_calling_vision(self):
+        config = {"source":"scans", "ocr":{"provider":"litellm", "enabled":False, "model":"vision", "prompt":"Saved OCR prompt"}}
+        result = self.upload(b"Original text", "test.txt", "text/plain", config)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()["result"], "Original text")
+        self.assertEqual(self.calls, [])
+
+    @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for shared row locking")
+    def test_concurrent_login_guards_do_not_lose_failures(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from backend.throttle import LoginThrottle
+        guards = [LoginThrottle(self.app.state.sessions), LoginThrottle(self.app.state.sessions)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda index: guards[index % 2].verify(lambda: False), range(16)))
+        self.assertEqual(sum(retry == 0 for accepted, retry in results), MAX_FAILED_LOGINS)
+        self.assertEqual(sum(retry > 0 for accepted, retry in results), 6)
+        with self.app.state.sessions() as session:
+            self.assertEqual(len(session.get(LoginGuard, "admin").failures), MAX_FAILED_LOGINS)
+
+    @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for concurrent migrations")
+    def test_parallel_migration_processes_adopt_a_fresh_schema(self):
+        import subprocess
+        import sys
+        target = self.database_for(self.storage)
+        environment = {**os.environ, "DATABASE_URL": target.render_as_string(hide_password=False)}
+        processes = [subprocess.Popen([sys.executable, "-m", "backend.migrate"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        try:
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+            engine, _ = open_database(target)
+            try:
+                with engine.connect() as connection:
+                    self.assertEqual(connection.execute(sql("SELECT version_num FROM alembic_version")).scalar_one(), "0005_keycloak")
+                    self.assertEqual(connection.execute(sql("SELECT count(*) FROM login_guard")).scalar_one(), 1)
+            finally:
+                engine.dispose()
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+
+class DatabaseConfigurationTests(unittest.TestCase):
+    def test_runtime_rejects_sqlite_and_requires_postgres_credentials(self):
+        with patch.dict("os.environ", {"DATABASE_URL": "sqlite:///data/ocr.sqlite3"}):
+            with self.assertRaisesRegex(RuntimeError, "PostgreSQL"):
+                configured_database_url()
+        with patch.dict("os.environ", {"DATABASE_URL": "", "POSTGRES_PASSWORD": ""}):
+            with self.assertRaisesRegex(RuntimeError, "POSTGRES_PASSWORD"):
+                configured_database_url()
+
+    def test_password_special_characters_are_preserved(self):
+        with patch.dict("os.environ", {"DATABASE_URL": "", "POSTGRES_PASSWORD": "a@:/?#%$", "POSTGRES_HOST": "db"}):
+            url = configured_database_url()
+        self.assertEqual(url.password, "a@:/?#%$")
+        self.assertEqual(url.host, "db")
+        self.assertEqual(url.drivername, "postgresql+psycopg")
+
+    def test_postgres_url_uses_psycopg3(self):
+        with patch.dict("os.environ", {"DATABASE_URL": "postgres://ocr:test@127.0.0.1/ocr"}):
+            engine, _ = open_database(configured_database_url())
+        try:
+            self.assertEqual(engine.dialect.driver, "psycopg")
+        finally:
+            engine.dispose()
 
 
 class ProxyTests(unittest.TestCase):

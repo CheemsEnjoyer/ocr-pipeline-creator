@@ -1,4 +1,4 @@
-"""Private S3 originals; local data contains only SQLite and administrator credentials."""
+"""Private S3 originals; PostgreSQL stores metadata and local data holds admin credentials."""
 
 import os
 import shutil

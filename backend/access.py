@@ -4,9 +4,7 @@ import math
 import os
 import re
 import secrets
-import threading
 import time
-from collections import deque
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
@@ -15,6 +13,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
 from .database import APIKey, AdminSession, SavedPipeline
+from .models import User
+from .accounts import initialize_account, session_hash, user_metadata, verify_password
+from .throttle import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS, LoginThrottle
 
 bearer = HTTPBearer(auto_error=False, scheme_name="API key", description="Ключ интеграции")
 COOKIE = "ocr_admin_session"
@@ -22,8 +23,6 @@ SESSION_SECONDS = 12 * 60 * 60
 PASSWORD_FILE = "admin-password.txt"
 MIN_PASSWORD_LENGTH = 8
 # Пароль, в отличие от ключа, бывает коротким, поэтому перебор ограничен.
-MAX_FAILED_LOGINS = 10
-FAILED_LOGIN_WINDOW = 10 * 60
 router = APIRouter()
 
 
@@ -34,17 +33,6 @@ def digest(value):
 def fingerprint(login, password):
     # Медленный хэш: по отпечатку в таблице сессий пароль быстро не подобрать.
     return hashlib.scrypt(f"{login}\0{password}".encode("utf-8"), salt=b"ocr-flow-admin", n=2**14, r=8, p=1, dklen=32).hex()
-
-
-class LoginThrottle:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.failures = deque()
-
-    def retry_after(self, moment):
-        while self.failures and moment - self.failures[0] >= FAILED_LOGIN_WINDOW:
-            self.failures.popleft()
-        return FAILED_LOGIN_WINDOW - (moment - self.failures[0]) if len(self.failures) >= MAX_FAILED_LOGINS else 0
 
 
 def initialize_admin(app, storage):
@@ -68,7 +56,8 @@ def initialize_admin(app, storage):
     if len(password) < MIN_PASSWORD_LENGTH:
         raise RuntimeError(f"{source}: пароль администратора должен содержать не менее {MIN_PASSWORD_LENGTH} символов")
     app.state.admin_fingerprint = fingerprint(login, password)
-    app.state.login_throttle = LoginThrottle()
+    app.state.login_throttle = LoginThrottle(app.state.sessions)
+    initialize_account(app, login, app.state.admin_fingerprint)
 
 
 def authenticate(request: Request, credentials: HTTPAuthorizationCredentials | None = Security(bearer)):
@@ -80,6 +69,7 @@ def authenticate(request: Request, credentials: HTTPAuthorizationCredentials | N
     request.state.is_admin = False
     request.state.pipeline_ids = []
     request.state.api_key_id = None
+    request.state.user_id = None
     if request.headers.get("authorization") is not None:
         # В заголовке принимаются только ключи интеграций; администратор входит через сессию.
         if credentials is None or len(credentials.credentials) > 512:
@@ -92,14 +82,26 @@ def authenticate(request: Request, credentials: HTTPAuthorizationCredentials | N
             request.state.api_key_id = key.id
         return
     cookie = request.cookies.get(COOKIE)
+    if request.app.state.auth_provider == "keycloak":
+        if not cookie or len(cookie) > 512:
+            raise HTTPException(401, "Требуется вход через Keycloak")
+        user = request.app.state.keycloak.authenticate(cookie)
+        request.state.user = user
+        request.state.user_id = user["id"]
+        request.state.is_admin = user["role"] == "admin"
+        return
     if cookie and len(cookie) <= 512:
         with request.app.state.sessions() as session:
             row = session.get(AdminSession, digest(cookie))
             # admin_hash хранит отпечаток логина и пароля: их смена завершает все сессии.
-            if row and row.expires_at > int(time.time()) and secrets.compare_digest(row.admin_hash, request.app.state.admin_fingerprint):
-                request.state.is_admin = True
-                return
-    raise HTTPException(401, "Требуется вход администратора или API-ключ")
+            if row and row.expires_at > int(time.time()):
+                user = session.get(User, row.user_id or request.app.state.bootstrap_user_id)
+                if user and user.status == "active" and secrets.compare_digest(row.admin_hash, session_hash(user)) and (not user.is_bootstrap or secrets.compare_digest(row.admin_hash, request.app.state.admin_fingerprint)):
+                    request.state.is_admin = user.role == "admin"
+                    request.state.user_id = user.id
+                    request.state.user = user_metadata(user)
+                    return
+    raise HTTPException(401, "Требуется вход пользователя или API-ключ")
 
 
 def public():
@@ -109,14 +111,19 @@ def public():
 def admin_only(request: Request, _identity: None = Depends(authenticate)):
     """Только интерфейс администратора: ключу интеграции такой маршрут закрыт."""
     if not request.state.is_admin:
-        raise HTTPException(403, "Этот API-ключ разрешает только работу с назначенными пайплайнами и своими документами")
+        raise HTTPException(403, "Для этого действия нужны права администратора")
 
 
 def integration_allowed(_identity: None = Depends(authenticate)):
     """Администратор и ключ интеграции. Свои пайплайны и документы ключу выбирают сами обработчики."""
 
 
-POLICIES = (public, admin_only, integration_allowed)
+def workspace_only(request: Request, _identity: None = Depends(authenticate)):
+    if not request.state.user_id:
+        raise HTTPException(403, "Требуется вход пользователя")
+
+
+POLICIES = (public, admin_only, integration_allowed, workspace_only)
 
 
 def verify_policies(app):
@@ -157,35 +164,48 @@ def validate_settings(session, payload):
 
 @router.post("/api/auth/login", dependencies=[Depends(public)])
 def login(payload: Login, request: Request, response: Response):
+    if request.app.state.auth_provider == "keycloak":
+        raise HTTPException(409, "Используйте вход через Keycloak")
     throttle = request.app.state.login_throttle
-    # Проверки идут по одной: счётчик точен, а параллельные scrypt не съедают память.
-    with throttle.lock:
-        moment = time.monotonic()
-        retry = throttle.retry_after(moment)
-        if retry:
-            raise HTTPException(429, f"Слишком много неудачных попыток входа. Повторите через {math.ceil(retry / 60)} мин.")
-        if not secrets.compare_digest(fingerprint(payload.login.strip(), payload.password), request.app.state.admin_fingerprint):
-            throttle.failures.append(moment)
-            raise HTTPException(401, "Неверный логин или пароль")
-        throttle.failures.clear()
+    identity = {}
+    def check():
+        with request.app.state.sessions() as session:
+            user = session.scalar(select(User).where(User.login == payload.login.strip(), User.status == "active"))
+            if user and (secrets.compare_digest(fingerprint(user.login, payload.password), request.app.state.admin_fingerprint) if user.is_bootstrap else verify_password(payload.password, user.password_hash)):
+                identity.update(id=user.id, hash=session_hash(user))
+                return True
+            if user is None:
+                fingerprint(payload.login.strip(), payload.password)
+            return False
+    accepted, retry = throttle.verify(check)
+    if retry:
+        raise HTTPException(429, f"Слишком много неудачных попыток входа. Повторите через {math.ceil(retry / 60)} мин.")
+    if not accepted:
+        raise HTTPException(401, "Неверный логин или пароль")
     token = secrets.token_urlsafe(32)
     with request.app.state.sessions.begin() as session:
+        user = session.scalar(select(User).where(User.id == identity["id"]).with_for_update())
+        if user is None or user.status != "active" or not secrets.compare_digest(session_hash(user), identity["hash"]):
+            raise HTTPException(401, "Учётная запись изменена. Войдите снова")
         session.execute(delete(AdminSession).where(AdminSession.expires_at <= int(time.time())))
         previous = request.cookies.get(COOKIE)
         if previous:
             session.execute(delete(AdminSession).where(AdminSession.token_hash == digest(previous)))
-        session.add(AdminSession(token_hash=digest(token), admin_hash=request.app.state.admin_fingerprint, expires_at=int(time.time()) + SESSION_SECONDS))
+        session.add(AdminSession(token_hash=digest(token), admin_hash=identity["hash"], user_id=user.id, expires_at=int(time.time()) + SESSION_SECONDS))
     response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True, samesite="strict", secure=os.getenv("OCR_SECURE_COOKIE") == "1", path="/")
     return {"status": "ok"}
 
 
-@router.get("/api/auth/session", dependencies=[Depends(admin_only)])
-def current_session():
-    return {"role": "admin"}
+@router.get("/api/auth/session", dependencies=[Depends(workspace_only)])
+def current_session(request: Request):
+    return request.state.user
 
 
-@router.post("/api/auth/logout", dependencies=[Depends(admin_only)])
+@router.post("/api/auth/logout", dependencies=[Depends(workspace_only)])
 def logout(request: Request, response: Response):
+    if request.app.state.auth_provider == "keycloak":
+        from .api.keycloak import end_session
+        return end_session(request, response)
     token = request.cookies.get(COOKIE)
     if token:
         with request.app.state.sessions.begin() as session:

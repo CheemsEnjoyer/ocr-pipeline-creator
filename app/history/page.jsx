@@ -7,6 +7,8 @@ import Header from "@/components/Header";
 import ExtractedText from "@/components/ExtractedText";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from "@/components/ui/alert-dialog";
 
@@ -34,6 +36,9 @@ export default function HistoryPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [page, setPage] = useState(0);
+  const [pipelineId, setPipelineId] = useState("");
+  const [pipelines, setPipelines] = useState([]);
+  const [pipelineError, setPipelineError] = useState("");
   const [hasMore, setHasMore] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [leaveUrl, setLeaveUrl] = useState(null);
@@ -58,21 +63,50 @@ export default function HistoryPage() {
     setRefresh((value) => value + 1);
   };
 
+  const filterPipeline = (value) => {
+    setPipelineId(value === "*" ? "" : value);
+    setPage(0);
+    setDocuments([]);
+    setSelectedId(null);
+    setDocument(null);
+    setDraft({});
+    setHasMore(false);
+    setLoading(true);
+    setDetailLoading(true);
+    setError("");
+    setDetailError("");
+    setSaveError("");
+    setSaved(false);
+  };
+
   useEffect(() => {
     const controller = new AbortController();
-    getJSON(`/api/documents?page=${page}`, { signal: controller.signal }).then((data) => {
+    getJSON("/api/history/pipelines", { signal: controller.signal }).then((data) => {
+      setPipelines(data.pipelines);
+      setPipelineError("");
+    }).catch((error) => { if (error.name !== "AbortError") setPipelineError(error.message); });
+    return () => controller.abort();
+  }, [refresh]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const query = new URLSearchParams({ page: String(page) });
+    if (pipelineId) query.set("pipeline_id", pipelineId);
+    getJSON(`/api/documents?${query}`, { signal: controller.signal }).then((data) => {
+      if (controller.signal.aborted) return;
       setDocuments((current) => page === 0 ? data.documents : [...current.filter((item) => !data.documents.some((entry) => entry.id === item.id)), ...data.documents]);
       setHasMore(data.hasMore);
-      setSelectedId((current) => current || new URLSearchParams(window.location.search).get("document") || data.documents[0]?.id || null);
+      setSelectedId((current) => current || (!pipelineId && new URLSearchParams(window.location.search).get("document")) || data.documents[0]?.id || null);
     }).catch((error) => { if (error.name !== "AbortError") setError(error.message); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [page, refresh]);
+  }, [page, refresh, pipelineId]);
 
   useEffect(() => {
     if (!selectedId) return;
     const controller = new AbortController();
     getJSON(`/api/documents/${encodeURIComponent(selectedId)}`, { signal: controller.signal }).then((data) => {
+      if (controller.signal.aborted) return;
       setDocument(data.document);
       setDraft(draftFrom(data.document.fields));
     }).catch((error) => { if (error.name !== "AbortError") setDetailError(error.message); })
@@ -123,8 +157,10 @@ export default function HistoryPage() {
     <div className="history-workspace">
       <aside className="history-list">
         <div className="history-list-heading"><div><h1>Документы</h1><p>Результаты обработки</p></div><History size={20}/></div>
+        <div className="main-field"><Label htmlFor="history-pipeline">Пайплайн</Label><Select value={pipelineId || "*"} onValueChange={filterPipeline} disabled={Boolean(dirty) || saving}><SelectTrigger id="history-pipeline"><SelectValue placeholder="Все пайплайны"/></SelectTrigger><SelectContent><SelectItem value="*">Все пайплайны</SelectItem>{pipelines.map((pipeline) => <SelectItem key={pipeline.id} value={pipeline.id}>{pipeline.name} · {pipeline.id}{pipeline.deleted ? " (удалён)" : ""}</SelectItem>)}</SelectContent></Select></div>
+        {pipelineError && <div className="history-error" role="alert">Не удалось загрузить список пайплайнов: {pipelineError}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
         {error && <div role="alert" className="history-error">{error}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
-        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>История пока пуста</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><Link href="/">Загрузить документ</Link></Button></div>}
+        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>{pipelineId ? "У этого пайплайна пока нет документов" : "История пока пуста"}</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><Link href="/">Загрузить документ</Link></Button></div>}
         {dirty && <p className="history-notice">Сохраните или отмените правки, чтобы выбрать другой документ.</p>}
         <div className="document-list">{documents.map((item) => <button key={item.id} className={`document-row ${selectedId === item.id ? "selected" : ""}`} aria-pressed={selectedId === item.id} disabled={Boolean(dirty) || saving} onClick={() => selectDocument(item.id)}>
           <span className="document-row-icon"><FileText size={19}/></span><span className="document-row-info"><strong>{item.filename}</strong><span>{item.pipeline_name}</span><small>{date(item.created_at)}</small></span><Check size={14} className="document-row-check"/>

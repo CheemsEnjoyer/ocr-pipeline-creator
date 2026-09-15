@@ -2,7 +2,7 @@ import "./globals.css";
 import AuthGate from "@/components/AuthGate";
 import AppNavigation from "@/components/AppNavigation";
 export const metadata = {
-    title: "OCR Flow Studio — конструктор пайплайнов",
+    title: "OCR Pipeline Creator — конструктор пайплайнов",
     description: "Визуальная настройка распознавания и извлечения данных из документов.",
     icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
 };

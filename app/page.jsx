@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertCircle, Check, ChevronRight, CloudUpload, FileText, LoaderCircle, Play, Trash2, Workflow } from "lucide-react";
 import Header from "@/components/Header";
@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { describePipeline } from "@/lib/pipelines";
 import { usePipelines } from "@/hooks/use-pipelines";
+import { waitForJob } from "@/lib/jobs";
+import { useSession } from "@/hooks/use-session";
 
 const ACCEPT = "image/*,application/pdf,.txt,.md,.csv,.json,.html,.docx";
 
@@ -18,16 +20,19 @@ function formatSize(bytes) {
 }
 
 export default function ProcessPage() {
+  const isAdmin = useSession()?.role === "admin";
   const { pipelines, ready, error: pipelineError } = usePipelines();
   const [pipelineId, setPipelineId] = useState("");
   const [items, setItems] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [running, setRunning] = useState(false);
   const inputRef = useRef(null);
+  const runController = useRef(null);
+  useEffect(() => () => runController.current?.abort(), []);
 
   const pipeline = useMemo(() => pipelines.find((item) => item.id === pipelineId) ?? pipelines[0] ?? null, [pipelines, pipelineId]);
   const summary = pipeline ? describePipeline(pipeline) : null;
-  const canRun = Boolean(pipeline) && items.length > 0 && !running;
+  const canRun = Boolean(pipeline) && items.some((item) => item.status !== "done") && !running;
 
   const addFiles = (fileList) => {
     const incoming = Array.from(fileList ?? []).map((file) => ({ id: `${file.name}-${file.size}-${file.lastModified}`, file, status: "idle" }));
@@ -38,20 +43,32 @@ export default function ProcessPage() {
 
   const run = async () => {
     setRunning(true);
-    for (const item of items) {
+    const controller = new AbortController();
+    runController.current = controller;
+    await Promise.all(items.filter((item) => item.status !== "done").map(async (item) => {
       patch(item.id, { status: "processing", result: undefined, error: undefined });
       try {
-        const body = new FormData();
-        body.append("file", item.file);
-        body.append("pipeline", JSON.stringify(pipeline));
-        const response = await fetch("/api/pipeline/run", { method: "POST", body });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Обработка не удалась");
-        patch(item.id, { status: "done", result: data.result, documentId: data.documentId });
+        let taskId = item.taskId;
+        if (!taskId) {
+          const body = new FormData();
+          body.append("file", item.file);
+          body.append("pipeline", JSON.stringify(pipeline));
+          const response = await fetch("/api/pipeline/run?background=true", { method: "POST", body, signal: controller.signal });
+          const data = await response.json();
+          if (!response.ok && !data.taskId) throw new Error(data.error || "Обработка не удалась");
+          taskId = data.taskId;
+          if (!taskId) throw new Error("Сервер не вернул ID задачи");
+          patch(item.id, { taskId });
+          if (!response.ok) throw new Error(data.error || "Очередь обработки недоступна");
+        }
+        const result = await waitForJob(`/api/jobs/${encodeURIComponent(taskId)}`, { signal: controller.signal });
+        patch(item.id, { status: "done", result: result.result, documentId: result.documentId });
       } catch (error) {
+        if (controller.signal.aborted) return;
         patch(item.id, { status: "error", error: error.message || "Обработка не удалась" });
+        if (error.taskFailed) patch(item.id, { taskId: undefined });
       }
-    }
+    }));
     setRunning(false);
   };
 
@@ -95,7 +112,7 @@ export default function ProcessPage() {
           <Workflow size={22}/>
           <strong>Пайплайнов пока нет</strong>
           <span>Соберите первый пайплайн в конструкторе — он появится здесь.</span>
-          <Button size="sm" asChild><Link href="/createpipeline">Открыть конструктор<ChevronRight size={15}/></Link></Button>
+          {isAdmin && <Button size="sm" asChild><Link href="/createpipeline">Открыть конструктор<ChevronRight size={15}/></Link></Button>}
         </div> : <>
           <Select value={pipeline?.id ?? ""} onValueChange={setPipelineId} disabled={running}>
             <SelectTrigger className="process-pipeline-trigger" aria-label="Выберите пайплайн" title={pipeline?.name || "Без названия"}><SelectValue placeholder="Выберите пайплайн"/></SelectTrigger>

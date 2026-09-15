@@ -16,7 +16,7 @@ async function proxy(request: Request) {
   }
   const base = process.env.BACKEND_URL || "http://127.0.0.1:8000";
   const headers = new Headers();
-  for (const name of ["content-type", "range", "if-range", "authorization", "cookie"]) {
+  for (const name of ["content-type", "range", "if-range", "authorization", "cookie", "origin"]) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -33,7 +33,7 @@ async function proxy(request: Request) {
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(600_000)]),
     });
     const responseHeaders = new Headers();
-    for (const name of ["content-type", "content-disposition", "content-length", "content-range", "accept-ranges", "x-content-type-options", "content-security-policy"]) {
+    for (const name of ["content-type", "content-disposition", "content-length", "content-range", "accept-ranges", "x-content-type-options", "content-security-policy", "location"]) {
       const value = upstream.headers.get(name);
       if (value) responseHeaders.set(name, value);
     }

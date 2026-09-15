@@ -19,11 +19,6 @@ WORKDIR /app
 COPY --from=build /app /app
 ENV NODE_ENV=production \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    HOST=0.0.0.0 \
-    PORT=5173 \
-    BACKEND_PORT=8000 \
-    BACKEND_URL=http://127.0.0.1:8000 \
-    OCR_DATA_DIR=/app/data
+    PYTHONDONTWRITEBYTECODE=1
 EXPOSE 5173
 CMD ["node", "scripts/run-app.mjs", "start"]

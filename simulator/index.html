@@ -104,7 +104,14 @@ $('upload').onclick = () => action(async () => {
   if (file.size > 20 * 1024 * 1024) throw new Error('Максимальный размер файла — 20 МБ.');
   const body = new FormData(); body.append('file', file);
   status('Документ обрабатывается. Дождитесь ответа…');
-  const data = await request(`/api/v1/pipelines/${encodeURIComponent($('pipeline').value)}/run`, { method:'POST', body });
+  let data = await request(`/api/v1/pipelines/${encodeURIComponent($('pipeline').value)}/run?background=true`, { method:'POST', body });
+  const taskId = data.taskId; const deadline = Date.now() + 600000;
+  while (data.status === 'queued' || data.status === 'processing') {
+    if (Date.now() >= deadline) throw new Error(`Ожидание заняло больше 10 минут. Задача ${taskId} продолжает выполняться; проверьте историю перед повторной отправкой.`);
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    data = await request(`/api/v1/jobs/${encodeURIComponent(taskId)}`);
+  }
+  if (data.status === 'failed') throw new Error(data.error || 'Обработка не удалась.');
   show(data); status('Обработка завершена. Нажмите «Импортировать / обновить», чтобы получить документ во внешней системе.');
 });
 $('sync').onclick = () => action(async () => {

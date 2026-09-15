@@ -36,6 +36,16 @@ test("forwards multipart file without corrupting content", async (t) => {
   assert.equal((await response.json()).documentId, "doc-1");
 });
 
+test("forwards background job status without exposing admin credentials", async (t) => {
+  const base = await simulator(t, async (url, options) => {
+    assert.equal(url.pathname, "/api/v1/jobs/task-1");
+    assert.deepEqual(options.headers, headers);
+    return Response.json({ taskId: "task-1", status: "succeeded", documentId: "doc-1" });
+  });
+  const response = await fetch(base + "/api/v1/jobs/task-1", { headers });
+  assert.equal((await response.json()).documentId, "doc-1");
+});
+
 test("preserves revoked key and forbidden pipeline errors", async (t) => {
   for (const status of [401, 403, 404]) {
     const base = await simulator(t, async () => Response.json({ detail: "Нет доступа" }, { status }));

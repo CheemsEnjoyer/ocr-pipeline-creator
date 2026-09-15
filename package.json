@@ -1,5 +1,5 @@
 {
-  "name": "ocr-pipeline-studio",
+  "name": "ocr-pipeline-creator",
   "version": "0.1.0",
   "private": true,
   "engines": {
@@ -10,10 +10,14 @@
     "dev": "node scripts/run-app.mjs dev",
     "simulator": "node scripts/import-simulator.mjs",
     "test:simulator": "node --test scripts/import-simulator.test.mjs",
+    "test:auth": "node --experimental-strip-types --test lib/auth-proxy.test.mjs",
     "build": "vinext build",
     "start": "node scripts/run-app.mjs start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "backend:setup": "node scripts/run-app.mjs setup",
+    "worker": "node scripts/run-app.mjs worker",
+    "dispatcher": "node scripts/run-app.mjs dispatcher",
+    "migrate": "node scripts/run-app.mjs migrate",
     "test:backend": "node scripts/run-app.mjs test"
   },
   "dependencies": {

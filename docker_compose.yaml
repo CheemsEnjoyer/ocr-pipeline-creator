@@ -1,0 +1,109 @@
+services:
+  app:
+    build: .
+    image: ocr-pipeline-creator:local
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${PORT:-5173}:5173"
+    env_file: &app-env-file
+      - path: .env
+        required: false
+    environment: &app-environment
+      HOST: 0.0.0.0
+      PORT: "5173"
+      BACKEND_PORT: "8000"
+      BACKEND_URL: http://127.0.0.1:8000
+      OCR_DATA_DIR: /app/data
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-ocr}
+      POSTGRES_DB: ${POSTGRES_DB:-ocr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      OCR_EXTERNAL_WORKER: "1"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/api/health', {signal: AbortSignal.timeout(5000)}).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  worker:
+    image: ocr-pipeline-creator:local
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: *app-env-file
+    environment: *app-environment
+    command: ["/app/.venv/bin/python", "-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 5m
+
+  migrate:
+    image: ocr-pipeline-creator:local
+    build: .
+    env_file: *app-env-file
+    environment: *app-environment
+    command: ["/app/.venv/bin/python", "-m", "backend.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  dispatcher:
+    image: ocr-pipeline-creator:local
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: *app-env-file
+    environment: *app-environment
+    command: ["/app/.venv/bin/python", "-m", "backend.dispatcher"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ocr}
+      POSTGRES_DB: ${POSTGRES_DB:-ocr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres-data:
+  redis-data:

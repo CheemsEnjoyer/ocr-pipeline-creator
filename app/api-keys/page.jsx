@@ -109,7 +109,7 @@ export default function APIKeysPage() {
   };
   const logout = async () => {
     setBusy(true);
-    try { await api("/api/auth/logout", "POST"); window.location.assign("/login"); }
+    try { const data = await api("/api/auth/logout", "POST"); window.location.assign(data.logoutUrl || "/login"); }
     catch (error) { setError(error.message); setBusy(false); }
   };
 

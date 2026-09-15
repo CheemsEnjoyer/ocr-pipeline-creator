@@ -1,1 +1,1 @@
-"""Python API for OCR Flow Studio."""
+"""Python API for OCR Pipeline Creator."""

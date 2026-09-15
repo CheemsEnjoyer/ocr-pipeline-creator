@@ -9,7 +9,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 process.chdir(root);
 if (existsSync(".env")) process.loadEnvFile(".env");
 const mode = process.argv[2] || "dev";
-if (!["setup", "test", "dev", "start"].includes(mode)) throw new Error("Unknown launch mode");
+if (!["setup", "test", "worker", "dispatcher", "migrate", "dev", "start"].includes(mode)) throw new Error("Unknown launch mode");
 const windows = process.platform === "win32";
 const python = path.join(root, ".venv", windows ? "Scripts/python.exe" : "bin/python");
 const children = new Set();
@@ -73,9 +73,37 @@ async function requireFreePort(port) {
   });
 }
 
+function launchWorker() {
+  const worker = launch(python, ["-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", ...(windows ? ["--pool=solo"] : ["--concurrency=2"])]);
+  worker.once("error", (error) => { console.error(error.message); stop(1); });
+  worker.once("exit", (code) => { if (!stopping) stop(code || 1); });
+  return worker;
+}
+
+function launchDispatcher() {
+  const dispatcher = launch(python, ["-m", "backend.dispatcher"]);
+  dispatcher.once("error", (error) => { console.error(error.message); stop(1); });
+  dispatcher.once("exit", (code) => { if (!stopping) stop(code || 1); });
+  return dispatcher;
+}
+
 try {
   await setup();
   if (mode === "setup") process.exit(0);
+  if (mode === "migrate") {
+    await run(python, ["-m", "backend.migrate"]);
+    process.exit(0);
+  }
+  if (mode === "dispatcher") {
+    const dispatcher = launchDispatcher();
+    await new Promise((resolve) => dispatcher.once("exit", resolve));
+    process.exit(0);
+  }
+  if (mode === "worker") {
+    const worker = launchWorker();
+    await new Promise((resolve) => worker.once("exit", resolve));
+    process.exit(0);
+  }
   if (mode === "test") {
     await run(python, ["-m", "unittest", "discover", "-s", "backend/tests", "-v"]);
     process.exit(0);
@@ -94,10 +122,14 @@ try {
     try {
       const response = await fetch(`http://127.0.0.1:${backendPort}/api/health`, { signal: AbortSignal.timeout(1000) });
       if (response.ok) { ready = true; break; }
-    } catch { /* Wait for FastAPI startup and automatic table creation. */ }
+    } catch { /* Wait for FastAPI startup and Alembic migrations. */ }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   if (!ready) throw new Error("Python-сервер не запустился. Проверьте сообщение выше.");
+  if (process.env.OCR_EXTERNAL_WORKER !== "1") {
+    launchWorker();
+    launchDispatcher();
+  }
   console.log("База готова. Запускаем интерфейс…");
   const frontend = launch(process.execPath, ["node_modules/vinext/dist/cli.js", mode, "--port", String(frontendPort), "--hostname", process.env.HOST || "127.0.0.1"], { env: { ...process.env, BACKEND_URL: process.env.BACKEND_URL || `http://127.0.0.1:${backendPort}` } });
   frontend.once("error", (error) => { console.error(error.message); stop(1); });

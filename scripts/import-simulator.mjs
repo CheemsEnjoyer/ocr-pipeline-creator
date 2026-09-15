@@ -24,7 +24,7 @@ export function createSimulator({ target = "http://127.0.0.1:8000", fetchImpl = 
         return;
       }
       const allowed = req.method === "GET"
-        ? /^\/api\/v1\/(pipelines|documents(?:\/[\w-]+)?)$/.test(url.pathname)
+        ? /^\/api\/v1\/(pipelines|documents(?:\/[\w-]+)?|jobs\/[\w-]+)$/.test(url.pathname)
         : req.method === "POST" && /^\/api\/v1\/pipelines\/[\w-]+\/run$/.test(url.pathname);
       if (!allowed) return fail(404, "Маршрут не найден");
       // Reject cross-origin browser requests; credentials are never stored by this service.
