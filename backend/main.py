@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import false, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .access import initialize_admin, require_access, router as access_router
@@ -46,6 +46,10 @@ class FieldUpdate(BaseModel):
 
 class PipelineImport(Pipeline):
     id: str = Field(min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
+
+
+class PipelineUpdate(Pipeline):
+    id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
 
 
 def serialize_pipeline(row):
@@ -143,12 +147,18 @@ def create_app(database_url=None, data_dir=None, transport=None):
             return {"pipelines": [serialize_pipeline(row) for row in rows]}
 
     @app.post("/api/pipelines", status_code=201)
-    def create_pipeline(payload: Pipeline):
+    def create_pipeline(payload: PipelineImport):
         timestamp = now()
         with app.state.sessions() as session:
-            row = SavedPipeline(id=f"pl_{uuid4()}", config=payload.model_dump(mode="json"), created_at=timestamp, updated_at=timestamp)
+            if session.get(SavedPipeline, payload.id) is not None:
+                raise HTTPException(409, "Этот ID пайплайна уже занят. Укажите другой ID.")
+            row = SavedPipeline(id=payload.id, config=payload.model_dump(mode="json", exclude={"id"}), created_at=timestamp, updated_at=timestamp)
             session.add(row)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as error:
+                session.rollback()
+                raise HTTPException(409, "Этот ID пайплайна уже занят. Укажите другой ID.") from error
             return {"pipeline": serialize_pipeline(row)}
 
     @app.post("/api/pipelines/import")
@@ -165,12 +175,14 @@ def create_app(database_url=None, data_dir=None, transport=None):
         return {"status": "ok"}
 
     @app.patch("/api/pipelines/{pipeline_id}")
-    def update_pipeline(pipeline_id: str, payload: Pipeline):
+    def update_pipeline(pipeline_id: str, payload: PipelineUpdate):
         with app.state.sessions() as session:
             row = session.get(SavedPipeline, pipeline_id)
             if row is None or row.deleted:
                 raise HTTPException(404, "Пайплайн не найден")
-            row.config = payload.model_dump(mode="json")
+            if payload.id is not None and payload.id != pipeline_id:
+                raise HTTPException(400, "ID сохранённого пайплайна нельзя изменить")
+            row.config = payload.model_dump(mode="json", exclude={"id"})
             row.updated_at = now()
             session.commit()
             return {"pipeline": serialize_pipeline(row)}

@@ -14,6 +14,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { savePipeline } from "@/lib/pipelines";
 
+const validPipelineId = (value) => /^[a-zA-Z0-9_-]{1,80}$/.test(value);
+
 const validTemperature = (value) => String(value).trim() !== "" && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 2;
 
 const stepMeta = [
@@ -30,6 +32,7 @@ const initialFields = [
 
 export default function PipelineEditor({ initialPipeline = null, onCreateNew }) {
   const [step, setStep] = useState(1);
+  const [pipelineId, setPipelineId] = useState(initialPipeline?.id ?? "");
   const [name, setName] = useState(initialPipeline?.name ?? "Обработка входящих счетов");
   const [sourceType, setSourceType] = useState(initialPipeline?.source ?? "scans");
   const [ocrMode, setOcrMode] = useState(initialPipeline?.ocr?.provider ?? "litellm");
@@ -65,18 +68,18 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
 
 
   const isValid = useMemo(() => {
-    if (step === 1) return name.trim().length >= 3;
+    if (step === 1) return name.trim().length >= 3 && validPipelineId(pipelineId);
     if (step === 2) return Boolean(sourceType);
     if (step === 3 && sourceType === "scans") return ocrMode === "litellm" ? Boolean(ocrModel) && validTemperature(ocrTemperature) && visionPrompt.trim().length > 0 : /^https?:\/\//.test(ocrServiceUrl);
     if (step === 4) return skipExtraction || (validTemperature(extractionTemperature) && Boolean(llmModel) && maxTokens >= 1 && (extractionMode === "prompt" ? prompt.trim().length > 0 : fields.length > 0 && fields.every((field) => field.name.trim() && field.description.trim())));
     return true;
-  }, [ocrTemperature, extractionTemperature, step, name, sourceType, ocrMode, ocrModel, ocrServiceUrl, visionPrompt, skipExtraction, llmModel, maxTokens, extractionMode, prompt, fields]);
+  }, [ocrTemperature, extractionTemperature, step, name, pipelineId, sourceType, ocrMode, ocrModel, ocrServiceUrl, visionPrompt, skipExtraction, llmModel, maxTokens, extractionMode, prompt, fields]);
 
   // Поля формы сохранённого пайплайна не теряются при редактировании.
   const serviceOptions = initialPipeline?.ocr?.url === ocrServiceUrl ? initialPipeline?.ocr?.options ?? {} : {};
 
   const pipeline = {
-    name: name.trim(), source: sourceType,
+    id: pipelineId, name: name.trim(), source: sourceType,
     ocr: sourceType === "scans" ? (ocrMode === "litellm" ? { provider: "litellm", model: ocrModel, temperature: Number(ocrTemperature), prompt: visionPrompt } : { provider: "service", url: ocrServiceUrl, ...(Object.keys(serviceOptions).length ? { options: serviceOptions } : {}) }) : null,
     extraction: skipExtraction ? null : { mode: extractionMode, model: llmModel, max_tokens: Number(maxTokens), temperature: Number(extractionTemperature), ...(extractionMode === "prompt" ? { prompt } : { fields: fields.map(({ name, description }) => ({ name, description })) }) },
   };
@@ -84,13 +87,14 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
   const finish = async () => {
     if (savingRef.current) return;
     setSaveError("");
+    if (!validPipelineId(pipelineId)) { setSaveError("Укажите ID: от 1 до 80 латинских букв, цифр, символов _ или -."); setStep(1); return; }
     const fieldsValid = fields.length > 0 && fields.every((field) => field.name.trim() && field.description.trim()) && new Set(fields.map((field) => field.name.trim())).size === fields.length;
     if (name.trim().length < 3 || (sourceType === "scans" && (ocrMode === "litellm" ? !ocrModel || !validTemperature(ocrTemperature) || !visionPrompt.trim() : !/^https?:\/\//.test(ocrServiceUrl))) || (!skipExtraction && (!validTemperature(extractionTemperature) || !llmModel || Number(maxTokens) < 1 || Number(maxTokens) > 128000 || !Number.isInteger(Number(maxTokens)) || (extractionMode === "prompt" ? !prompt.trim() : !fieldsValid)))) {
       setSaveError("Проверьте название, настройки OCR и извлечения. Названия полей должны быть уникальными."); return;
     }
     savingRef.current = true;
     setSaving(true);
-    try { const saved = await savePipeline({ ...pipeline, ...(savedId ? { id: savedId } : {}) }); setSavedId(saved.id); setCreated(true); }
+    try { const saved = await savePipeline(pipeline, savedId); setSavedId(saved.id); setCreated(true); }
     catch (error) { setSaveError(error.message); }
     finally { savingRef.current = false; setSaving(false); }
   };
@@ -103,11 +107,11 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
     const lifecycle = new AbortController();
     try { void Promise.resolve(context.registerTool({
       name: "configure_ocr_pipeline", title: "Настроить OCR-пайплайн", description: "Заполняет основные параметры мастера создания OCR-пайплайна.",
-      inputSchema: { type: "object", properties: { name: { type: "string" }, source: { type: "string", enum: ["scans", "document"] }, extractionMode: { type: "string", enum: ["prompt", "fields"] }, model: { type: "string" }, maxTokens: { type: "integer", minimum: 1 } }, required: ["name", "source", "extractionMode", "model", "maxTokens"], additionalProperties: false },
-      annotations: { readOnlyHint: false, untrustedContentHint: false }, execute(input) { setName(input.name); setSourceType(input.source); setExtractionMode(input.extractionMode); setLlmModel(input.model); setMaxTokens(input.maxTokens); setStep(4); return { configured: true, name: input.name }; },
+      inputSchema: { type: "object", properties: { id: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,80}$" }, name: { type: "string" }, source: { type: "string", enum: ["scans", "document"] }, extractionMode: { type: "string", enum: ["prompt", "fields"] }, model: { type: "string" }, maxTokens: { type: "integer", minimum: 1 } }, required: ["id", "name", "source", "extractionMode", "model", "maxTokens"], additionalProperties: false },
+      annotations: { readOnlyHint: false, untrustedContentHint: false }, execute(input) { if (!savedId) setPipelineId(input.id); setName(input.name); setSourceType(input.source); setExtractionMode(input.extractionMode); setLlmModel(input.model); setMaxTokens(input.maxTokens); setStep(4); return { configured: true, name: input.name }; },
     }, { signal: lifecycle.signal })).catch(() => undefined); } catch { /* WebMCP is optional. */ }
     return () => lifecycle.abort();
-  }, []);
+  }, [savedId]);
 
   if (created) return <main className="app-shell success-shell"><div className="success-card"><div className="success-icon"><Check size={28}/></div><p className="eyebrow">ПАЙПЛАЙН ГОТОВ</p><h1>{pipeline.name}</h1><p>Пайплайн сохранён. Его можно выбрать для обработки или отредактировать на странице «Пайплайны».</p><PipelineSummary pipeline={pipeline}/><div className="success-actions"><Button variant="outline" onClick={() => setCreated(false)}>Продолжить редактирование</Button><Button variant="outline" onClick={() => { if (onCreateNew) onCreateNew(); else window.location.assign("/createpipeline"); }}>Создать ещё один</Button><Button variant="outline" asChild><Link href="/pipelines">Все пайплайны</Link></Button><Button asChild><Link href="/">Загрузить документы<ArrowRight size={16}/></Link></Button></div></div></main>;
 
@@ -117,7 +121,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
       <aside className="step-sidebar"><div><p className="eyebrow">{initialPipeline ? "РЕДАКТИРОВАНИЕ" : "НОВЫЙ ПАЙПЛАЙН"}</p><h2>Ответьте на 4 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => { const disabled = item.number === 4 && skipExtraction; return <button key={item.number} disabled={disabled} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""} ${disabled ? "disabled" : ""}`} onClick={() => !disabled && setStep(item.number)}><span>{disabled ? <X size={14}/> : step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{disabled ? "Отключено в настройках Vision" : item.short}</small></div></button>; })}</nav></aside>
 
       <section className="question-area"><div className="progress-row"><span>Шаг {step} из 4</span><div><i style={{ width: `${step * 25}%` }}/></div><strong>{step * 25}%</strong></div><div className="question-card">
-        {step === 1 && <StepName name={name} setName={setName}/>}
+        {step === 1 && <StepName name={name} setName={setName} pipelineId={pipelineId} setPipelineId={setPipelineId} idLocked={Boolean(savedId)}/>}
         {step === 2 && <StepSource sourceType={sourceType} setSourceType={(value) => { setSourceType(value); setSkipExtraction(false); }}/>}
         {step === 3 && <StepOcr temperature={ocrTemperature} setTemperature={setOcrTemperature} sourceType={sourceType} ocrMode={ocrMode} setOcrMode={(value) => { setOcrMode(value); setSkipExtraction(false); }} ocrModel={ocrModel} setOcrModel={setOcrModel} ocrServiceUrl={ocrServiceUrl} setOcrServiceUrl={setOcrServiceUrl} visionPrompt={visionPrompt} setVisionPrompt={setVisionPrompt} skipExtraction={skipExtraction} setSkipExtraction={setSkipExtraction} models={models} modelsLoading={modelsLoading} modelError={modelError}/>}
         {step === 4 && <StepExtraction temperature={extractionTemperature} setTemperature={setExtractionTemperature} extractionMode={extractionMode} setExtractionMode={setExtractionMode} prompt={prompt} setPrompt={setPrompt} fields={fields} setFields={setFields} addField={addField} llmModel={llmModel} setLlmModel={setLlmModel} maxTokens={maxTokens} setMaxTokens={setMaxTokens} models={models} modelsLoading={modelsLoading} modelError={modelError}/>}
@@ -129,7 +133,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
   </main>;
 }
 
-function StepName({ name, setName }) { return <div className="step-content"><StepHeading icon={FileInput} kicker="НАЧНЁМ С ОСНОВНОГО" title="Как назовём пайплайн?" copy="Название поможет быстро найти его в списке и понять назначение."/><div className="main-field"><Label htmlFor="pipeline-name">Название пайплайна</Label><Input id="pipeline-name" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Например, обработка входящих счетов"/><small>{name.length} / 80</small></div><div className="example-line"><span>Примеры</span><button onClick={() => setName("Распознавание актов")}>Распознавание актов</button><button onClick={() => setName("Разбор договоров")}>Разбор договоров</button></div></div>; }
+function StepName({ name, setName, pipelineId, setPipelineId, idLocked }) { return <div className="step-content"><StepHeading icon={FileInput} kicker="НАЧНЁМ С ОСНОВНОГО" title="Как назовём пайплайн?" copy="Название поможет быстро найти его в списке и понять назначение."/><div className="main-field"><Label htmlFor="pipeline-name">Название пайплайна</Label><Input id="pipeline-name" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Например, обработка входящих счетов"/><small>{name.length} / 80</small></div><div className="main-field"><Label htmlFor="pipeline-id">ID пайплайна</Label><Input id="pipeline-id" value={pipelineId} readOnly={idLocked} maxLength={80} required aria-describedby="pipeline-id-help" aria-invalid={!idLocked && pipelineId.length > 0 && !validPipelineId(pipelineId)} onChange={(event) => setPipelineId(event.target.value)} placeholder="Например, invoices_2026"/><small id="pipeline-id-help">{idLocked ? "ID используется в API и не меняется после сохранения." : "Обязательный уникальный ID: 1–80 латинских букв, цифр, _ или -. После сохранения изменить нельзя."}</small></div><div className="example-line"><span>Примеры</span><button onClick={() => setName("Распознавание актов")}>Распознавание актов</button><button onClick={() => setName("Разбор договоров")}>Разбор договоров</button></div></div>; }
 
 function StepSource({ sourceType, setSourceType }) { return <div className="step-content"><StepHeading icon={FileText} kicker="ТИП ИСХОДНЫХ ФАЙЛОВ" title="Откуда нужно получить текст?" copy="От ответа зависит, потребуется ли этап OCR."/><RadioGroup value={sourceType} onValueChange={setSourceType} className="choice-grid"><ChoiceCard value="scans" icon={Image} title="Сканы или изображения" copy="PNG, JPG и PDF-сканы без текстового слоя" badge="Потребуется OCR"/><ChoiceCard value="document" icon={FileText} title="Цифровой документ" copy="PDF, DOCX, TXT и другие файлы с текстом" badge="Текст извлекается напрямую"/></RadioGroup></div>; }
 
@@ -151,4 +155,4 @@ function TemperatureField({ id, value, setValue }) {
 }
 function ModelField({ label, value, setValue, models, modelsLoading, modelError }) { return <div className="main-field model-field"><Label>{label}</Label><Select value={value} onValueChange={setValue} disabled={modelsLoading && !value}><SelectTrigger><SelectValue placeholder={modelsLoading ? "Загружаем модели…" : "Выберите модель"}/></SelectTrigger><SelectContent>{value && !models.includes(value) && <SelectItem value={value}>{value}</SelectItem>}{models.map((model) => <SelectItem key={model} value={model}>{model}</SelectItem>)}</SelectContent></Select><small className={modelError ? "error" : ""}>{modelError || `${models.length} моделей доступно через LiteLLM`}</small></div>; }
 function SummaryRow({ number, label, value }) { return <div className="summary-row"><span>{number}</span><div><small>{label}</small><strong>{value}</strong></div></div>; }
-function PipelineSummary({ pipeline }) { return <div className="final-summary"><div><span>Источник</span><strong>{pipeline.source === "scans" ? "Сканы / изображения" : "Цифровой документ"}</strong></div><div><span>OCR</span><strong>{pipeline.ocr ? (pipeline.ocr.model || pipeline.ocr.url) : "Не требуется"}</strong></div><div><span>Извлечение</span><strong>{pipeline.extraction ? (pipeline.extraction.mode === "prompt" ? "Промпт" : `${pipeline.extraction.fields.length} параметра`) : "Отключено"}</strong></div><div><span>LLM</span><strong>{pipeline.extraction ? `${pipeline.extraction.model} · ${pipeline.extraction.max_tokens} tokens` : "Ответ Vision-модели"}</strong></div></div>; }
+function PipelineSummary({ pipeline }) { return <div className="final-summary"><div><span>ID пайплайна</span><strong>{pipeline.id}</strong></div><div><span>Источник</span><strong>{pipeline.source === "scans" ? "Сканы / изображения" : "Цифровой документ"}</strong></div><div><span>OCR</span><strong>{pipeline.ocr ? (pipeline.ocr.model || pipeline.ocr.url) : "Не требуется"}</strong></div><div><span>Извлечение</span><strong>{pipeline.extraction ? (pipeline.extraction.mode === "prompt" ? "Промпт" : `${pipeline.extraction.fields.length} параметра`) : "Отключено"}</strong></div><div><span>LLM</span><strong>{pipeline.extraction ? `${pipeline.extraction.model} · ${pipeline.extraction.max_tokens} tokens` : "Ответ Vision-модели"}</strong></div></div>; }

@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from uuid import uuid4
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -74,11 +75,11 @@ class APITests(unittest.TestCase):
 
     def test_pipeline_catalog_and_run(self):
         self.assertEqual(self.client.get("/api/pipelines").json(), {"pipelines": []})
-        config = {"name": "Catalog test", "source": "scans", "ocr": {"provider": "litellm", "model": "vision", "temperature": 0.4}, "extraction": {"mode": "prompt", "model": "extract", "prompt": "JSON", "temperature": 0.7, "max_tokens": 512}}
+        config = {"id": "invoices_2026", "name": "Catalog test", "source": "scans", "ocr": {"provider": "litellm", "model": "vision", "temperature": 0.4}, "extraction": {"mode": "prompt", "model": "extract", "prompt": "JSON", "temperature": 0.7, "max_tokens": 512}}
         created = self.client.post("/api/pipelines", json=config)
         self.assertEqual(created.status_code, 201, created.text)
         pipeline = created.json()["pipeline"]
-        self.assertTrue(pipeline["id"].startswith("pl_"))
+        self.assertEqual(pipeline["id"], "invoices_2026")
         listed = self.client.get("/api/pipelines").json()["pipelines"]
         self.assertEqual(listed, [pipeline])
         self.assertEqual(self.upload(b"image", "scan.png", "image/png", listed[0]).status_code, 200)
@@ -89,6 +90,32 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"][0]["name"], "Updated")
         self.assertEqual(self.client.delete(f"/api/pipelines/{pipeline['id']}").status_code, 200)
         self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"], [])
+
+    def test_user_pipeline_id_validation_uniqueness_and_api_access(self):
+        config = {"id": "invoices_2026", "name": "Invoices", "source": "document", "extraction": None}
+        for invalid in (None, "", "bad id", "../other", "счета", "x" * 81, "bad\n"):
+            payload = {**config, "id": invalid}
+            if invalid is None:
+                payload.pop("id")
+            self.assertEqual(self.client.post("/api/pipelines", json=payload).status_code, 422)
+        created = self.client.post("/api/pipelines", json=config)
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(created.json()["pipeline"]["id"], config["id"])
+        self.assertEqual(self.client.post("/api/pipelines", json={**config, "name": "Duplicate"}).status_code, 409)
+        self.assertEqual(self.client.patch("/api/pipelines/invoices_2026", json={**config, "id": "renamed"}).status_code, 400)
+        key = self.client.post("/api/keys", json={"name": "Integration", "pipeline_ids": [config["id"]]}).json()["token"]
+        self.client.cookies.clear()
+        headers = {"Authorization": f"Bearer {key}"}
+        listed = self.client.get("/api/v1/pipelines", headers=headers).json()["pipelines"]
+        self.assertEqual(listed[0]["id"], config["id"])
+        self.assertEqual(listed[0]["name"], "Invoices")
+        result = self.client.post("/api/v1/pipelines/invoices_2026/run", headers=headers, files={"file": ("test.txt", b"Invoice 1500", "text/plain")})
+        self.assertEqual(result.status_code, 200, result.text)
+        document = self.client.get(f"/api/v1/documents/{result.json()['documentId']}", headers=headers).json()["document"]
+        self.assertEqual(document["pipeline_id"], config["id"])
+        self.sign_in(self.client)
+        self.client.delete("/api/pipelines/invoices_2026")
+        self.assertEqual(self.client.post("/api/pipelines", json=config).status_code, 409)
 
     def test_pipeline_import_preserves_edits_and_deletions(self):
         legacy = {"id": "pl_legacy", "name": "Legacy", "source": "document", "extraction": None}
@@ -214,7 +241,7 @@ class APITests(unittest.TestCase):
                 self.assertEqual(app.state.proxy, "http://proxy.company.local:8080")
 
     def create_pipeline(self, name):
-        response = self.client.post("/api/pipelines", json={"name": name, "source": "document", "extraction": None})
+        response = self.client.post("/api/pipelines", json={"id": f"test_{uuid4().hex}", "name": name, "source": "document", "extraction": None})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["pipeline"]["id"]
 
@@ -419,7 +446,7 @@ class APITests(unittest.TestCase):
                 self.assertIn("idx_documents_api_key", {index["name"] for index in inspector.get_indexes("documents")})
             old = client.get("/api/documents/old-doc").json()["document"]
             self.assertEqual((old["filename"], old["fields"], old["pipeline_id"]), ("old.txt", {}, None))
-            pipeline = client.post("/api/pipelines", json={"name": "Новый", "source": "document", "extraction": None}).json()["pipeline"]["id"]
+            pipeline = client.post("/api/pipelines", json={"id": "new_pipeline", "name": "Новый", "source": "document", "extraction": None}).json()["pipeline"]["id"]
             token = client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [pipeline]}).json()["token"]
             integration = TestClient(app, headers={"Authorization": "Bearer " + token})
             # Старые документы остаются только у администратора.
