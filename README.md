@@ -25,23 +25,25 @@ npm run dev
 Нужен Docker Desktop с запущенным движком Linux containers и Docker Compose 2.24+.
 Node.js и Python на компьютере для этого способа не нужны.
 
-Скопируйте `.env.example` в `.env`, задайте `POSTGRES_PASSWORD` и настройте S3;
+Скопируйте `.env.example` в `.env`, настройте подключение к существующей PostgreSQL
+через `DATABASE_URL` или `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`,
+`POSTGRES_DB`, `POSTGRES_PASSWORD`. Задайте `CELERY_BROKER_URL` существующего Redis и настройте S3;
 при необходимости задайте пароль администратора и параметры LiteLLM.
 Затем в папке проекта выполните:
 
 ```powershell
-docker compose up -d --build
+docker compose -f docker_compose.yaml up -d --build
 ```
 
-Откройте http://localhost:5173. Логи: `docker compose logs -f`.
-Остановка: `docker compose down`. После изменения кода повторите команду запуска со сборкой.
+Откройте http://localhost:5173. Логи: `docker compose -f docker_compose.yaml logs -f`.
+Остановка: `docker compose -f docker_compose.yaml down`. После изменения кода повторите команду запуска со сборкой.
 
-PostgreSQL запускается отдельным сервисом `db`. Сервис `migrate` применяет миграции;
+PostgreSQL и Redis должны быть запущены отдельно и доступны из контейнеров.
+Compose не создаёт их контейнеры и тома. Сервис `migrate` применяет миграции к указанной базе;
 приложение, воркер и диспетчер ждут его успешного завершения.
-Redis, Celery worker и диспетчер также запускаются автоматически. Воркер обрабатывает
-до двух документов одновременно; Redis сохраняет очередь в volume `redis-data`.
-База сохраняется в Docker volume `postgres-data`, включая после `docker compose down`.
-Порт базы на компьютер не публикуется. Сгенерированный пароль сохраняется в папке `data`
+Celery worker и диспетчер запускаются автоматически. Воркер обрабатывает
+до двух документов одновременно. Сохранение данных PostgreSQL и очереди Redis
+настраивается на существующих серверах. Сгенерированный пароль администратора сохраняется в папке `data`
 на компьютере. Уже существующая папка `data`
 используется автоматически. Если пароль не задан, он находится в `data/admin-password.txt`.
 Файл `.env` передаётся при запуске, данные и секреты в образ не копируются.
@@ -50,19 +52,21 @@ Redis, Celery worker и диспетчер также запускаются а�
 В контейнере интерфейс слушает `0.0.0.0:5173`, Python API — только `127.0.0.1:8000`.
 Compose публикует интерфейс только на локальном компьютере. `PORT` в `.env`
 меняет порт компьютера; внутренние порты, `HOST`, `BACKEND_URL` и `OCR_DATA_DIR`
-зафиксированы в `compose.yaml`. Для доступа с других компьютеров измените привязку
+зафиксированы в `docker_compose.yaml`. Для доступа с других компьютеров измените привязку
 `127.0.0.1` в `ports` и настройте reverse proxy с HTTPS.
 
-Если LiteLLM или OCR-сервис запущен на этом же компьютере, используйте в его адресе
+Если PostgreSQL, Redis, LiteLLM или OCR-сервис запущен на этом же компьютере, используйте в его адресе
 `host.docker.internal` вместо `localhost` (Docker Desktop).
 
 ## PostgreSQL
 
-В Docker Compose база создаётся автоматически. В `.env` задайте непустой
-`POSTGRES_PASSWORD`; имя пользователя и базы по умолчанию — `ocr`.
+Используется существующая база PostgreSQL. В `.env` задайте адрес сервера
+`POSTGRES_HOST`, порт `POSTGRES_PORT`, имя базы `POSTGRES_DB`, пользователя
+`POSTGRES_USER` и непустой `POSTGRES_PASSWORD`. База и пользователь должны существовать;
+пользователю нужны права для применения миграций приложения.
 Пароль передаётся драйверу отдельно, поэтому спецсимволы в `POSTGRES_PASSWORD`
-не требуют URL-кодирования. После создания Docker volume изменение этих переменных
-не меняет существующих пользователей и их пароли в PostgreSQL.
+не требуют URL-кодирования. Изменение этих переменных не меняет существующих
+пользователей и их пароли в PostgreSQL.
 
 Для отдельного сервера можно задать `DATABASE_URL`, например:
 
@@ -115,7 +119,7 @@ S3_PREFIX=originals
 Смену бакета или endpoint выполняйте вместе с переносом объектов: старые ключи
 читаются из текущего бакета. Старые исходники в `data/originals` остаются доступными
 и автоматически в S3 не переносятся. После изменения `.env` в Docker выполните
-`docker compose up -d --force-recreate`.
+`docker compose -f docker_compose.yaml up -d --force-recreate`.
 
 SDK S3: [официальная документация Boto3](https://docs.aws.amazon.com/boto3/latest/reference/services/s3.html).
 
@@ -170,7 +174,7 @@ UUID на странице не сохраняется после перезаг
 Должно соблюдаться `soft < hard < lease`. Синхронный запуск ограничивает время OCR/извлечения
 общим таймаутом и возвращает HTTP 504 при его превышении.
 
-Логи Docker: `docker compose logs -f worker dispatcher redis migrate`.
+Логи Docker: `docker compose -f docker_compose.yaml logs -f worker dispatcher migrate`.
 Для отдельных процессов задайте `OCR_EXTERNAL_WORKER=1` и запустите `npm run worker`
 и `npm run dispatcher` в отдельных терминалах. На Linux используется стандартный пул процессов, на Windows —
 `solo` для локальной разработки; для развёртывания используйте Linux-контейнер Docker.
