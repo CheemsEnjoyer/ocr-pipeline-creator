@@ -36,14 +36,24 @@ class S3Storage:
 
     @classmethod
     def from_env(cls):
-        bucket = os.getenv("S3_BUCKET", "").strip()
+        bucket = os.getenv("S3_BUCKET_NAME", "").strip() or os.getenv("S3_BUCKET", "").strip()
         if not bucket:
-            raise RuntimeError("Задайте S3_BUCKET в .env: исходные файлы сохраняются в S3.")
+            raise RuntimeError("Задайте S3_BUCKET_NAME или S3_BUCKET в .env: исходные файлы сохраняются в S3.")
+        access_key = os.getenv("S3_ACCESS_KEY_ID")
+        secret_key = os.getenv("S3_SECRET_ACCESS_KEY")
+        credentials = {}
+        if access_key or secret_key:
+            if not access_key or not secret_key:
+                raise RuntimeError("Задайте обе переменные S3_ACCESS_KEY_ID и S3_SECRET_ACCESS_KEY.")
+            credentials = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key}
+            if os.getenv("AWS_SESSION_TOKEN"):
+                credentials["aws_session_token"] = os.environ["AWS_SESSION_TOKEN"]
         style = os.getenv("S3_ADDRESSING_STYLE", "auto").strip()
         if style not in {"auto", "path", "virtual"}:
             raise RuntimeError("S3_ADDRESSING_STYLE должен быть auto, path или virtual.")
         client = boto3.client(
             "s3",
+            **credentials,
             endpoint_url=os.getenv("S3_ENDPOINT_URL") or None,
             region_name=os.getenv("S3_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1",
             config=Config(

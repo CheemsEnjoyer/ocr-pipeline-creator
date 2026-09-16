@@ -92,22 +92,25 @@ SQLite больше не используется приложением. Сущ
 ## S3: исходные файлы
 
 Все новые исходные файлы сохраняются в существующий приватный S3-бакет.
-Без `S3_BUCKET` API не запускается; при ошибке S3 файл не сохраняется локально,
+Без `S3_BUCKET_NAME` (или `S3_BUCKET`) API не запускается; при ошибке S3 файл не сохраняется локально,
 а запрос возвращает HTTP 503. Бакет автоматически не создаётся.
 
 Пример `.env`:
 
 ```dotenv
-S3_BUCKET=ocr-documents
+S3_BUCKET_NAME=ocr-documents
 S3_REGION=us-east-1
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
+S3_ACCESS_KEY_ID=your-access-key
+S3_SECRET_ACCESS_KEY=your-secret-key
 S3_PREFIX=originals
 ```
 
 Для S3-совместимого сервиса задайте `S3_ENDPOINT_URL`, например
 `http://host.docker.internal:9000` для MinIO на компьютере с Docker Desktop,
 и при необходимости `S3_ADDRESSING_STYLE=path`.
+Поддерживаются и прежние имена `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+При наличии новых переменных `S3_BUCKET_NAME` и пары `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`
+они имеют приоритет; оба ключа пары должны быть заданы вместе.
 Для AWS оставьте `S3_ENDPOINT_URL` пустым. Вместо явных ключей можно использовать
 стандартную цепочку учётных данных Boto3, включая IAM role; временные ключи требуют
 `AWS_SESSION_TOKEN`. Старые переменные `OBJECT_STORAGE_*` не используются.
