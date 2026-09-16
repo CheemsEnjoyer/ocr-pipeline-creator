@@ -982,6 +982,25 @@ class APITests(unittest.TestCase):
         self.assertTrue(next(row for row in choices if row["id"] == "first")["deleted"])
         self.assertEqual(len(self.client.get("/api/documents?pipeline_id=first").json()["documents"]), 50)
 
+    def test_history_search_and_page_size(self):
+        ids = []
+        for filename in ("Invoice-100%.txt", "Invoice-200.txt", "Other.txt"):
+            response = self.upload(b"Document", filename, "text/plain")
+            self.assertEqual(response.status_code, 200, response.text)
+            ids.append(response.json()["documentId"])
+        first = self.client.get("/api/documents", params={"q": "invoice", "page_size": 1}).json()
+        second = self.client.get("/api/documents", params={"q": "invoice", "page_size": 1, "page": 1}).json()
+        self.assertTrue(first["hasMore"])
+        self.assertFalse(second["hasMore"])
+        self.assertEqual({first["documents"][0]["id"], second["documents"][0]["id"]}, set(ids[:2]))
+        literal = self.client.get("/api/documents", params={"q": "%"}).json()
+        self.assertEqual([row["id"] for row in literal["documents"]], [ids[0]])
+        exact = self.client.get("/api/documents", params={"q": ids[2]}).json()
+        self.assertEqual([row["id"] for row in exact["documents"]], [ids[2]])
+        self.assertEqual(self.client.get("/api/documents", params={"q": "missing"}).json()["documents"], [])
+        self.assertNotIn("text", first["documents"][0])
+        self.assertEqual(self.client.get("/api/documents?page_size=101").status_code, 422)
+
     def test_history_pipeline_filter_keeps_integration_ownership(self):
         self.client.post("/api/pipelines", json={"id":"owned", "name":"Owned", "source":"document"})
         self.client.post("/api/pipelines/owned/run", files={"file":("admin.txt", b"Admin document", "text/plain")})
@@ -992,6 +1011,8 @@ class APITests(unittest.TestCase):
         self.assertEqual(uploaded.status_code, 200)
         rows = self.client.get("/api/v1/documents?pipeline_id=owned", headers=headers).json()["documents"]
         self.assertEqual([row["id"] for row in rows], [uploaded.json()["documentId"]])
+        self.assertEqual(self.client.get("/api/v1/documents?q=admin&page_size=20", headers=headers).json()["documents"], [])
+        self.assertEqual(len(self.client.get("/api/v1/documents?q=owned&page_size=20", headers=headers).json()["documents"]), 1)
         self.assertEqual(self.client.get("/api/history/pipelines", headers=headers).status_code, 403)
 
     def test_background_status_links_match_api_prefix(self):

@@ -5,11 +5,14 @@ import { Check, Download, FileText, History, LoaderCircle, Save, ScanText } from
 import Header from "@/components/Header";
 import ExtractedText from "@/components/ExtractedText";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from "@/components/ui/alert-dialog";
+
+const PAGE_SIZE = 20;
 
 const date = (value) => new Date(value).toLocaleString("ru-RU", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 const fieldValue = (value) => typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -35,6 +38,8 @@ export default function HistoryPage() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [page, setPage] = useState(0);
+  const [searchInput, setSearchInput] = useState("");
+  const [search, setSearch] = useState("");
   const [pipelineId, setPipelineId] = useState("");
   const [pipelines, setPipelines] = useState([]);
   const [pipelineError, setPipelineError] = useState("");
@@ -62,8 +67,7 @@ export default function HistoryPage() {
     setRefresh((value) => value + 1);
   };
 
-  const filterPipeline = (value) => {
-    setPipelineId(value === "*" ? "" : value);
+  const resetList = () => {
     setPage(0);
     setDocuments([]);
     setSelectedId(null);
@@ -78,6 +82,23 @@ export default function HistoryPage() {
     setSaved(false);
   };
 
+  const filterPipeline = (value) => {
+    setPipelineId(value === "*" ? "" : value);
+    resetList();
+  };
+  const changePage = (value) => {
+    setPage(value);
+    setDocuments([]);
+    setLoading(true);
+    setError("");
+  };
+  const searchDocuments = (event) => {
+    event.preventDefault();
+    setSearch(searchInput.trim());
+    resetList();
+    setRefresh((value) => value + 1);
+  };
+
   useEffect(() => {
     const controller = new AbortController();
     getJSON("/api/history/pipelines", { signal: controller.signal }).then((data) => {
@@ -89,17 +110,17 @@ export default function HistoryPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    const query = new URLSearchParams({ page: String(page) });
+    const query = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE), q: search });
     if (pipelineId) query.set("pipeline_id", pipelineId);
     getJSON(`/api/documents?${query}`, { signal: controller.signal }).then((data) => {
       if (controller.signal.aborted) return;
-      setDocuments((current) => page === 0 ? data.documents : [...current.filter((item) => !data.documents.some((entry) => entry.id === item.id)), ...data.documents]);
+      setDocuments(data.documents);
       setHasMore(data.hasMore);
-      setSelectedId((current) => current || (!pipelineId && new URLSearchParams(window.location.search).get("document")) || data.documents[0]?.id || null);
+      setSelectedId((current) => current || (!pipelineId && !search && new URLSearchParams(window.location.search).get("document")) || data.documents[0]?.id || null);
     }).catch((error) => { if (error.name !== "AbortError") setError(error.message); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [page, refresh, pipelineId]);
+  }, [page, refresh, pipelineId, search]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -155,17 +176,25 @@ export default function HistoryPage() {
     <Header subtitle="История документов"/>
     <div className="history-workspace">
       <aside className="history-list">
-        <div className="history-list-heading"><div><h1>Документы</h1><p>Результаты обработки</p></div><History size={20}/></div>
+        <div className="history-list-heading"><div><h1>Документы</h1><p>Поиск и результаты обработки</p></div><History size={20}/></div>
+        <form className="history-search" onSubmit={searchDocuments}>
+          <Label htmlFor="history-search">Имя файла или ID</Label>
+          <div><Input id="history-search" type="search" placeholder="Найти документ…" maxLength={200} value={searchInput} onChange={(event) => setSearchInput(event.target.value)} disabled={Boolean(dirty) || saving}/><Button type="submit" variant="outline" disabled={loading || Boolean(dirty) || saving}>Найти</Button></div>
+          {search && <Button type="button" variant="ghost" size="sm" disabled={loading || Boolean(dirty) || saving} onClick={() => { setSearchInput(""); setSearch(""); resetList(); }}>Сбросить поиск</Button>}
+        </form>
         <div className="main-field"><Label htmlFor="history-pipeline">Пайплайн</Label><Select value={pipelineId || "*"} onValueChange={filterPipeline} disabled={Boolean(dirty) || saving}><SelectTrigger id="history-pipeline"><SelectValue placeholder="Все пайплайны"/></SelectTrigger><SelectContent><SelectItem value="*">Все пайплайны</SelectItem>{pipelines.map((pipeline) => <SelectItem key={pipeline.id} value={pipeline.id}>{pipeline.name} · {pipeline.id}{pipeline.deleted ? " (удалён)" : ""}</SelectItem>)}</SelectContent></Select></div>
         {pipelineError && <div className="history-error" role="alert">Не удалось загрузить список пайплайнов: {pipelineError}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
         {error && <div role="alert" className="history-error">{error}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
-        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>{pipelineId ? "У этого пайплайна пока нет документов" : "История пока пуста"}</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><a href="/">Загрузить документ</a></Button></div>}
+        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>{search ? "Ничего не найдено" : page > 0 ? "На этой странице нет документов" : pipelineId ? "У этого пайплайна пока нет документов" : "История пока пуста"}</strong><p>{search ? "Измените запрос или выберите другой пайплайн." : "Обработайте документ — его исходник, текст и поля появятся здесь."}</p><Button asChild size="sm"><a href="/">Загрузить документ</a></Button></div>}
         {dirty && <p className="history-notice">Сохраните или отмените правки, чтобы выбрать другой документ.</p>}
-        <div className="document-list">{documents.map((item) => <button key={item.id} className={`document-row ${selectedId === item.id ? "selected" : ""}`} aria-pressed={selectedId === item.id} disabled={Boolean(dirty) || saving} onClick={() => selectDocument(item.id)}>
-          <span className="document-row-icon"><FileText size={19}/></span><span className="document-row-info"><strong>{item.filename}</strong><span>{item.pipeline_name}</span><small>{date(item.created_at)}</small></span><Check size={14} className="document-row-check"/>
+        <div className="document-list" key={`${page}:${pipelineId}:${search}`}>{documents.map((item) => <button key={item.id} className={`document-row ${selectedId === item.id ? "selected" : ""}`} aria-pressed={selectedId === item.id} disabled={Boolean(dirty) || saving} onClick={() => selectDocument(item.id)}>
+          <span className="document-row-icon"><FileText size={19}/></span><span className="document-row-info"><strong title={item.filename}>{item.filename}</strong><span>{item.pipeline_name}</span><small>{date(item.created_at)}</small></span>{selectedId === item.id && <Check size={14} className="document-row-check"/>}
         </button>)}</div>
         {loading && <p className="history-loading" role="status"><LoaderCircle size={18} className="spin"/>Загружаем историю…</p>}
-        {hasMore && <Button variant="outline" disabled={loading || dirty || saving} onClick={() => { setLoading(true); setPage((value) => value + 1); }}>Загрузить ещё</Button>}
+        <nav className="history-pagination" aria-label="Страницы истории">
+          <p aria-live="polite">Страница {page + 1}{!loading && documents.length > 0 ? ` · ${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + documents.length}` : ""}</p>
+          <div><Button variant="outline" size="sm" disabled={page === 0 || loading || Boolean(dirty) || saving} onClick={() => changePage(page - 1)}>Назад</Button><Button variant="outline" size="sm" disabled={!hasMore || loading || Boolean(dirty) || saving || Boolean(error)} onClick={() => changePage(page + 1)}>Далее</Button></div>
+        </nav>
       </aside>
       <section className="document-workspace" aria-label="Выбранный документ">
         {detailLoading && selectedId && <div className="history-empty" role="status"><LoaderCircle className="spin"/>Загружаем документ…</div>}
