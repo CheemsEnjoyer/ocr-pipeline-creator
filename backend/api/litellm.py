@@ -6,7 +6,7 @@ from ..schemas import ChatRequest
 
 
 def create_router(app, storage):
-    router = APIRouter(tags=["Модели LiteLLM"])
+    router = APIRouter(tags=["LiteLLM Models"])
     @router.get("/api/litellm/models", dependencies=[Depends(admin_only)])
     async def models():
         base, headers = litellm_config()

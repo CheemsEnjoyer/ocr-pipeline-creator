@@ -68,15 +68,15 @@ def create_app(database_url=None, data_dir=None, transport=None):
         openapi_url="/api/openapi.json",
         swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect",
         openapi_tags=[
-            {"name": "Авторизация", "description": "Вход, выход, сессия и корпоративная авторизация."},
-            {"name": "Пайплайны", "description": "Создание, настройка и список пайплайнов."},
-            {"name": "Обработка", "description": "Запуск обработки документов."},
-            {"name": "Задания", "description": "Статус и повторный запуск фоновых заданий."},
-            {"name": "Документы", "description": "История, результаты, редактирование и исходные файлы."},
-            {"name": "Пользователи", "description": "Пользователи, роли и приглашения."},
-            {"name": "API-ключи", "description": "Ключи доступа для внешних систем."},
-            {"name": "Модели LiteLLM", "description": "Доступные модели и запросы к LiteLLM."},
-            {"name": "Система", "description": "Проверка работоспособности приложения."},
+            {"name": "Authentication", "description": "Sign-in, sign-out, sessions, and enterprise authentication."},
+            {"name": "Pipelines", "description": "Create, configure, and list pipelines."},
+            {"name": "Processing", "description": "Start document processing."},
+            {"name": "Jobs", "description": "Check the status of background jobs and retry failed jobs."},
+            {"name": "Documents", "description": "Document history, results, editing, and original files."},
+            {"name": "Users", "description": "Manage users, roles, and invitations."},
+            {"name": "API Keys", "description": "Manage access keys for external integrations."},
+            {"name": "LiteLLM Models", "description": "List available models and send requests to LiteLLM."},
+            {"name": "System", "description": "Check application health."},
         ],
         swagger_ui_parameters={"docExpansion": "none"},
     )
@@ -126,7 +126,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         logger.error("S3 operation failed: %s", type(error.__cause__).__name__)
         return JSONResponse({"error": redact(str(error))}, status_code=404 if isinstance(error, OriginalNotFound) else 503)
 
-    @app.get("/api/health", tags=["Система"], dependencies=[Depends(public)])
+    @app.get("/api/health", tags=["System"], dependencies=[Depends(public)])
     def health():
         with app.state.sessions() as session:
             session.execute(select(1))

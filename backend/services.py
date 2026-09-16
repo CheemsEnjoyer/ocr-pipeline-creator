@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from uuid import uuid4
 
@@ -12,7 +13,7 @@ from .config import JobSettings
 from .models import Document, ProcessingJob
 from .processing import extract, recognize, result_fields
 from .repositories import DocumentRepository, JobRepository, now
-from .security import redact
+from .security import redact, safe_url
 
 
 def build_document(document_id, original_key, filename, mime, size, parsed, text, result, pipeline_id, api_key_id):
@@ -27,9 +28,22 @@ def build_document(document_id, original_key, filename, mime, size, parsed, text
 
 async def process_pipeline(client, parsed, content, filename, mime, timeout):
     async def process():
-        text = await recognize(client, parsed, content, filename, mime)
-        result = await extract(client, parsed.extraction, text) if parsed.extraction else text
-        return text, result
+        stage = "recognition"
+        started = time.monotonic()
+        try:
+            text = await recognize(client, parsed, content, filename, mime)
+            stage = "extraction"
+            started = time.monotonic()
+            result = await extract(client, parsed.extraction, text) if parsed.extraction else text
+            return text, result
+        except httpx.TimeoutException as error:
+            request = getattr(error, "_request", None)
+            logging.getLogger("ocr.worker").error(
+                "Upstream timeout: stage=%s, error=%s, url=%s, elapsed=%.1fs",
+                stage, type(error).__name__, safe_url(request.url if request else None),
+                time.monotonic() - started,
+            )
+            raise
     return await asyncio.wait_for(process(), timeout=timeout)
 
 
@@ -51,6 +65,9 @@ def error_message(error):
         return redact(error.detail)
     if isinstance(error, (TimeoutError, SoftTimeLimitExceeded)):
         return "Превышено время одной попытки обработки"
+    if isinstance(error, httpx.TimeoutException):
+        request = getattr(error, "_request", None)
+        return redact(f"Сервис OCR или LiteLLM не ответил вовремя: {safe_url(request.url if request else None)}")
     return "Не удалось обработать документ. Проверьте доступность S3, OCR и LiteLLM."
 
 

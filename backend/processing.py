@@ -67,7 +67,7 @@ class Extraction(BaseModel):
 
 
 class Pipeline(BaseModel):
-    name: str = "Без названия"
+    name: str = "Untitled"
     source: Literal["scans", "document"]
     ocr: OCR | None = None
     extraction: Extraction | None = None

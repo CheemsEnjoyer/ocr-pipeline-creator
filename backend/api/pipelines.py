@@ -7,7 +7,7 @@ from ..schemas import PipelineImport, PipelineUpdate, serialize_pipeline
 
 
 def create_router(app, storage):
-    router = APIRouter(tags=["Пайплайны"])
+    router = APIRouter(tags=["Pipelines"])
 
     @router.post("/api/pipelines", status_code=201, dependencies=[Depends(admin_only)])
     def create_pipeline(payload: PipelineImport):

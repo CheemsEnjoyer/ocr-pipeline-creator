@@ -5,7 +5,7 @@ from fastapi.responses import RedirectResponse
 
 from ..access import COOKIE, public
 
-router = APIRouter(tags=["Авторизация"])
+router = APIRouter(tags=["Authentication"])
 STATE_COOKIE = "ocr_oidc_state"
 
 
