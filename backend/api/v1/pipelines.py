@@ -6,7 +6,7 @@ from ...schemas import serialize_pipeline
 
 
 def create_router(app, storage):
-    router = APIRouter()
+    router = APIRouter(tags=["Пайплайны"])
     @router.get("/pipelines", dependencies=[Depends(integration_allowed)])
     def list_pipelines(request: Request):
         with app.state.sessions() as session:

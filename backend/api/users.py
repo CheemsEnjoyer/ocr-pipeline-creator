@@ -32,7 +32,7 @@ def create_router(app, storage):
     if app.state.auth_provider == "keycloak":
         from .keycloak_users import create_router as external_router
         return external_router(app, storage)
-    router = APIRouter()
+    router = APIRouter(tags=["Пользователи"])
 
     @router.get("/api/users", dependencies=[Depends(admin_only)])
     def list_users():

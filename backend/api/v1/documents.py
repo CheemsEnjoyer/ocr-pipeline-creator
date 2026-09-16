@@ -6,7 +6,7 @@ from ...schemas import serialize
 
 
 def create_router(app, storage, policy=integration_allowed):
-    router = APIRouter()
+    router = APIRouter(tags=["Документы"])
     def visible_documents(request):
         # Администратор видит всю историю, ключ интеграции — только документы, которые обработал сам.
         query = select(Document)

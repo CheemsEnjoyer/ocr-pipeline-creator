@@ -14,7 +14,7 @@ def create_router(app, storage):
     router = APIRouter()
 
 
-    @router.get("/api/history/pipelines", dependencies=[Depends(workspace_only)])
+    @router.get("/api/history/pipelines", tags=["Документы"], dependencies=[Depends(workspace_only)])
     def history_pipelines():
         with app.state.sessions() as session:
             choices = {row.id: {"id": row.id, "name": row.config.get("name", row.id), "deleted": bool(row.deleted)} for row in session.scalars(select(SavedPipeline))}
@@ -24,7 +24,7 @@ def create_router(app, storage):
             return {"pipelines": sorted(choices.values(), key=lambda item: (item["name"], item["id"]))}
 
 
-    @router.patch("/api/documents/{document_id}", dependencies=[Depends(workspace_only)])
+    @router.patch("/api/documents/{document_id}", tags=["Документы"], dependencies=[Depends(workspace_only)])
     def update_fields(document_id: str, payload: FieldUpdate):
         if len(json.dumps(payload.fields, ensure_ascii=False)) > 1_000_000:
             raise HTTPException(400, "Поля документа слишком большие")
@@ -37,7 +37,7 @@ def create_router(app, storage):
                 raise HTTPException(409, "Документ изменился в другой вкладке. Откройте его заново перед сохранением.")
         return {"revision": payload.revision + 1, "updated_at": timestamp}
 
-    @router.get("/api/documents/{document_id}/original", dependencies=[Depends(workspace_only)])
+    @router.get("/api/documents/{document_id}/original", tags=["Документы"], dependencies=[Depends(workspace_only)])
     def original(document_id: str, request: Request):
         with app.state.sessions() as session:
             row = session.get(Document, document_id)

@@ -9,7 +9,7 @@ from ...config import MAX_FILE_SIZE
 
 
 def create_router(app, storage):
-    router = APIRouter()
+    router = APIRouter(tags=["Обработка"])
     def stored_pipeline(pipeline_id, request):
         if not request.state.user_id and pipeline_id not in request.state.pipeline_ids:
             raise HTTPException(403, "Ключу не разрешён этот пайплайн")

@@ -19,7 +19,7 @@ class Role(BaseModel):
 
 
 def create_router(app, storage):
-    router = APIRouter()
+    router = APIRouter(tags=["Пользователи"])
 
     @router.get("/api/users", dependencies=[Depends(admin_only)])
     def users():

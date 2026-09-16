@@ -8,7 +8,7 @@ from ...repositories import add_outbox, now
 
 
 def create_router(app, storage):
-    router = APIRouter()
+    router = APIRouter(tags=["Задания"])
     @router.get("/jobs/{job_id}", dependencies=[Depends(integration_allowed)])
     def job_status(job_id: str, request: Request):
         with app.state.sessions() as session:

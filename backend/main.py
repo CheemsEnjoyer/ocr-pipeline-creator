@@ -61,7 +61,25 @@ def create_app(database_url=None, data_dir=None, transport=None):
             if originals is not None:
                 originals.close()
 
-    app = FastAPI(title="OCR Pipeline Creator API", lifespan=lifespan)
+    app = FastAPI(
+        title="OCR Pipeline Creator API",
+        lifespan=lifespan,
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        swagger_ui_oauth2_redirect_url="/api/docs/oauth2-redirect",
+        openapi_tags=[
+            {"name": "Авторизация", "description": "Вход, выход, сессия и корпоративная авторизация."},
+            {"name": "Пайплайны", "description": "Создание, настройка и список пайплайнов."},
+            {"name": "Обработка", "description": "Запуск обработки документов."},
+            {"name": "Задания", "description": "Статус и повторный запуск фоновых заданий."},
+            {"name": "Документы", "description": "История, результаты, редактирование и исходные файлы."},
+            {"name": "Пользователи", "description": "Пользователи, роли и приглашения."},
+            {"name": "API-ключи", "description": "Ключи доступа для внешних систем."},
+            {"name": "Модели LiteLLM", "description": "Доступные модели и запросы к LiteLLM."},
+            {"name": "Система", "description": "Проверка работоспособности приложения."},
+        ],
+        swagger_ui_parameters={"docExpansion": "none"},
+    )
     app.state.auth_provider = os.getenv("AUTH_PROVIDER", "local").strip()
     if app.state.auth_provider not in {"local", "keycloak"}:
         raise RuntimeError("AUTH_PROVIDER: local или keycloak")
@@ -108,7 +126,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
         logger.error("S3 operation failed: %s", type(error.__cause__).__name__)
         return JSONResponse({"error": redact(str(error))}, status_code=404 if isinstance(error, OriginalNotFound) else 503)
 
-    @app.get("/api/health", dependencies=[Depends(public)])
+    @app.get("/api/health", tags=["Система"], dependencies=[Depends(public)])
     def health():
         with app.state.sessions() as session:
             session.execute(select(1))

@@ -162,7 +162,7 @@ def validate_settings(session, payload):
     return name, ids
 
 
-@router.post("/api/auth/login", dependencies=[Depends(public)])
+@router.post("/api/auth/login", tags=["Авторизация"], dependencies=[Depends(public)])
 def login(payload: Login, request: Request, response: Response):
     if request.app.state.auth_provider == "keycloak":
         raise HTTPException(409, "Используйте вход через Keycloak")
@@ -196,12 +196,12 @@ def login(payload: Login, request: Request, response: Response):
     return {"status": "ok"}
 
 
-@router.get("/api/auth/session", dependencies=[Depends(workspace_only)])
+@router.get("/api/auth/session", tags=["Авторизация"], dependencies=[Depends(workspace_only)])
 def current_session(request: Request):
     return request.state.user
 
 
-@router.post("/api/auth/logout", dependencies=[Depends(workspace_only)])
+@router.post("/api/auth/logout", tags=["Авторизация"], dependencies=[Depends(workspace_only)])
 def logout(request: Request, response: Response):
     if request.app.state.auth_provider == "keycloak":
         from .api.keycloak import end_session
@@ -214,13 +214,13 @@ def logout(request: Request, response: Response):
     return {"status": "ok"}
 
 
-@router.get("/api/keys", dependencies=[Depends(admin_only)])
+@router.get("/api/keys", tags=["API-ключи"], dependencies=[Depends(admin_only)])
 def list_keys(request: Request):
     with request.app.state.sessions() as session:
         return {"keys": [metadata(key) for key in session.scalars(select(APIKey).order_by(APIKey.created_at.desc(), APIKey.id))]}
 
 
-@router.post("/api/keys", status_code=201, dependencies=[Depends(admin_only)])
+@router.post("/api/keys", status_code=201, tags=["API-ключи"], dependencies=[Depends(admin_only)])
 def create_key(payload: KeySettings, request: Request):
     from datetime import datetime, timezone
     token = "ocr_" + secrets.token_urlsafe(32)
@@ -232,7 +232,7 @@ def create_key(payload: KeySettings, request: Request):
         return {"key": metadata(key), "token": token}
 
 
-@router.patch("/api/keys/{key_id}", dependencies=[Depends(admin_only)])
+@router.patch("/api/keys/{key_id}", tags=["API-ключи"], dependencies=[Depends(admin_only)])
 def update_key(key_id: str, payload: KeySettings, request: Request):
     with request.app.state.sessions() as session:
         key = session.get(APIKey, key_id)
@@ -243,7 +243,7 @@ def update_key(key_id: str, payload: KeySettings, request: Request):
         return {"key": metadata(key)}
 
 
-@router.delete("/api/keys/{key_id}", dependencies=[Depends(admin_only)])
+@router.delete("/api/keys/{key_id}", tags=["API-ключи"], dependencies=[Depends(admin_only)])
 def revoke_key(key_id: str, request: Request):
     from datetime import datetime, timezone
     with request.app.state.sessions() as session:
