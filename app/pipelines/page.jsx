@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import Link from "next/link";
 import { Pencil, Play, Plus, Trash2, Workflow } from "lucide-react";
 import Header from "@/components/Header";
 import { Button } from "@/components/ui/button";
@@ -23,7 +22,7 @@ export default function PipelinesPage() {
     <div className="pipelines-page">
       <div className="pipelines-heading">
         <div><p className="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</p><h1>Сохранённые пайплайны</h1><p>Открывайте, редактируйте и запускайте настроенные сценарии обработки документов.</p></div>
-        {isAdmin && <Button asChild><Link href="/createpipeline"><Plus size={17}/>Создать пайплайн</Link></Button>}
+        {isAdmin && <Button asChild><a href="/createpipeline"><Plus size={17}/>Создать пайплайн</a></Button>}
       </div>
 
       {loadError && <p className="history-error" role="alert">{loadError}</p>}
@@ -33,7 +32,7 @@ export default function PipelinesPage() {
         <Workflow size={38}/>
         <strong>Пайплайнов пока нет</strong>
         <p>Соберите первый сценарий в конструкторе — он появится здесь и станет доступен на странице обработки.</p>
-        {isAdmin && <Button asChild><Link href="/createpipeline">Создать пайплайн</Link></Button>}
+        {isAdmin && <Button asChild><a href="/createpipeline">Создать пайплайн</a></Button>}
       </div>}
 
       {ready && pipelines.length > 0 && <div className="pipeline-grid">{pipelines.map((pipeline) => {
@@ -48,8 +47,8 @@ export default function PipelinesPage() {
             <div><dt>Извлечение</dt><dd>{summary.extraction}</dd></div>
           </dl>
           <div className="pipeline-card-actions">
-            {isAdmin && <Button variant="outline" size="sm" asChild><Link href={`/pipelines/${encodeURIComponent(pipeline.id)}`}><Pencil size={15}/>Редактировать</Link></Button>}
-            <Button variant="ghost" size="sm" asChild><Link href="/"><Play size={15}/>Обработать</Link></Button>
+            {isAdmin && <Button variant="outline" size="sm" asChild><a href={`/pipelines/${encodeURIComponent(pipeline.id)}`}><Pencil size={15}/>Редактировать</a></Button>}
+            <Button variant="ghost" size="sm" asChild><a href="/"><Play size={15}/>Обработать</a></Button>
             {isAdmin && <button className="pipeline-card-delete" aria-label={`Удалить пайплайн «${pipeline.name}»`} onClick={() => { setError(""); setRemoving(pipeline); }}><Trash2 size={15}/></button>}
           </div>
         </article>;

@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useState } from "react";
 import { usePathname } from "next/navigation";
 import { History, KeyRound, Layers, ScanText, Workflow, ChevronUp, Settings, LogOut, Users, ShieldCheck } from "lucide-react";
@@ -41,7 +40,7 @@ function Navigation() {
       <nav aria-label="Основная навигация"><SidebarMenu>{links.filter((item) => user?.role === "admin" || !["/createpipeline", "/api-keys"].includes(item.href)).map(({ href, label, icon: Icon, match }) => {
         const active = match(pathname);
         return <SidebarMenuItem key={href}>
-          <SidebarMenuButton asChild isActive={active} className="navigation-link"><Link href={href} aria-current={active ? "page" : undefined} onClick={() => setOpenMobile(false)}><Icon size={19}/><span>{label}</span></Link></SidebarMenuButton>
+          <SidebarMenuButton asChild isActive={active} className="navigation-link"><a href={href} aria-current={active ? "page" : undefined} onClick={() => setOpenMobile(false)}><Icon size={19}/><span>{label}</span></a></SidebarMenuButton>
         </SidebarMenuItem>;
       })}</SidebarMenu></nav>
     </SidebarContent>

@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
 import { Check, Download, FileText, History, LoaderCircle, Save, ScanText } from "lucide-react";
 import Header from "@/components/Header";
 import ExtractedText from "@/components/ExtractedText";
@@ -160,7 +159,7 @@ export default function HistoryPage() {
         <div className="main-field"><Label htmlFor="history-pipeline">Пайплайн</Label><Select value={pipelineId || "*"} onValueChange={filterPipeline} disabled={Boolean(dirty) || saving}><SelectTrigger id="history-pipeline"><SelectValue placeholder="Все пайплайны"/></SelectTrigger><SelectContent><SelectItem value="*">Все пайплайны</SelectItem>{pipelines.map((pipeline) => <SelectItem key={pipeline.id} value={pipeline.id}>{pipeline.name} · {pipeline.id}{pipeline.deleted ? " (удалён)" : ""}</SelectItem>)}</SelectContent></Select></div>
         {pipelineError && <div className="history-error" role="alert">Не удалось загрузить список пайплайнов: {pipelineError}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
         {error && <div role="alert" className="history-error">{error}<Button variant="outline" size="sm" disabled={dirty || saving} onClick={reload}>Повторить</Button></div>}
-        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>{pipelineId ? "У этого пайплайна пока нет документов" : "История пока пуста"}</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><Link href="/">Загрузить документ</Link></Button></div>}
+        {!loading && !error && !documents.length && <div className="history-empty"><FileText size={30}/><strong>{pipelineId ? "У этого пайплайна пока нет документов" : "История пока пуста"}</strong><p>Обработайте документ — его исходник, текст и поля появятся здесь.</p><Button asChild size="sm"><a href="/">Загрузить документ</a></Button></div>}
         {dirty && <p className="history-notice">Сохраните или отмените правки, чтобы выбрать другой документ.</p>}
         <div className="document-list">{documents.map((item) => <button key={item.id} className={`document-row ${selectedId === item.id ? "selected" : ""}`} aria-pressed={selectedId === item.id} disabled={Boolean(dirty) || saving} onClick={() => selectDocument(item.id)}>
           <span className="document-row-icon"><FileText size={19}/></span><span className="document-row-info"><strong>{item.filename}</strong><span>{item.pipeline_name}</span><small>{date(item.created_at)}</small></span><Check size={14} className="document-row-check"/>

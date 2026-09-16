@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import { AlertCircle, Check, ChevronRight, CloudUpload, FileText, LoaderCircle, Play, Trash2, Workflow } from "lucide-react";
 import Header from "@/components/Header";
 import { Button } from "@/components/ui/button";
@@ -100,7 +99,7 @@ export default function ProcessPage() {
             <FileStatus status={item.status}/>
             <button className="remove-field" onClick={() => setItems(items.filter((entry) => entry.id !== item.id))} disabled={running} aria-label="Удалить файл"><Trash2 size={16}/></button>
             {item.status === "error" && <p className="file-error"><AlertCircle size={14}/>{item.error}</p>}
-            {item.status === "done" && <div className="processed-document-link"><Check size={15}/><span>Сохранён в истории</span><Button variant="outline" size="sm" asChild><Link href={`/history?document=${encodeURIComponent(item.documentId)}`}>Открыть документ<ChevronRight size={15}/></Link></Button></div>}
+            {item.status === "done" && <div className="processed-document-link"><Check size={15}/><span>Сохранён в истории</span><Button variant="outline" size="sm" asChild><a href={`/history?document=${encodeURIComponent(item.documentId)}`}>Открыть документ<ChevronRight size={15}/></a></Button></div>}
           </article>)}
         </div>}
       </section>
@@ -112,7 +111,7 @@ export default function ProcessPage() {
           <Workflow size={22}/>
           <strong>Пайплайнов пока нет</strong>
           <span>Соберите первый пайплайн в конструкторе — он появится здесь.</span>
-          {isAdmin && <Button size="sm" asChild><Link href="/createpipeline">Открыть конструктор<ChevronRight size={15}/></Link></Button>}
+          {isAdmin && <Button size="sm" asChild><a href="/createpipeline">Открыть конструктор<ChevronRight size={15}/></a></Button>}
         </div> : <>
           <Select value={pipeline?.id ?? ""} onValueChange={setPipelineId} disabled={running}>
             <SelectTrigger className="process-pipeline-trigger" aria-label="Выберите пайплайн" title={pipeline?.name || "Без названия"}><SelectValue placeholder="Выберите пайплайн"/></SelectTrigger>

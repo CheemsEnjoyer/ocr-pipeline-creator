@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import { ArrowLeft, ArrowRight, Check, FileInput, FileText, Image, Plus, ScanText, Sparkles, Trash2 } from "lucide-react";
 import Header from "@/components/Header";
 import { Button } from "@/components/ui/button";
@@ -116,7 +115,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
     return () => lifecycle.abort();
   }, [savedId]);
 
-  if (created) return <main className="app-shell success-shell"><div className="success-card"><div className="success-icon"><Check size={28}/></div><p className="eyebrow">ПАЙПЛАЙН ГОТОВ</p><h1>{pipeline.name}</h1><p>Пайплайн сохранён. Его можно выбрать для обработки или отредактировать на странице «Пайплайны».</p><PipelineSummary pipeline={pipeline}/><div className="success-actions"><Button variant="outline" onClick={() => setCreated(false)}>Продолжить редактирование</Button><Button variant="outline" onClick={() => { if (onCreateNew) onCreateNew(); else window.location.assign("/createpipeline"); }}>Создать ещё один</Button><Button variant="outline" asChild><Link href="/pipelines">Все пайплайны</Link></Button><Button asChild><Link href="/">Загрузить документы<ArrowRight size={16}/></Link></Button></div></div></main>;
+  if (created) return <main className="app-shell success-shell"><div className="success-card"><div className="success-icon"><Check size={28}/></div><p className="eyebrow">ПАЙПЛАЙН ГОТОВ</p><h1>{pipeline.name}</h1><p>Пайплайн сохранён. Его можно выбрать для обработки или отредактировать на странице «Пайплайны».</p><PipelineSummary pipeline={pipeline}/><div className="success-actions"><Button variant="outline" onClick={() => setCreated(false)}>Продолжить редактирование</Button><Button variant="outline" onClick={() => { if (onCreateNew) onCreateNew(); else window.location.assign("/createpipeline"); }}>Создать ещё один</Button><Button variant="outline" asChild><a href="/pipelines">Все пайплайны</a></Button><Button asChild><a href="/">Загрузить документы<ArrowRight size={16}/></a></Button></div></div></main>;
 
   return <main className="app-shell">
     <Header subtitle={initialPipeline ? "Редактирование пайплайна" : "Создание пайплайна"}/>
