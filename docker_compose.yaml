@@ -19,6 +19,7 @@ services:
       BACKEND_URL: http://127.0.0.1:8000
       OCR_DATA_DIR: /app/data
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:?Set CELERY_BROKER_URL in .env to your existing Redis}
+      OCR_WORKER_CONCURRENCY: ${OCR_WORKER_CONCURRENCY:-4}
       OCR_EXTERNAL_WORKER: "1"
     volumes:
       - ./data:/app/data
@@ -36,7 +37,7 @@ services:
     restart: unless-stopped
     env_file: *app-env-file
     environment: *app-environment
-    command: ["/app/.venv/bin/python", "-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    command: ["/app/.venv/bin/python", "-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=${OCR_WORKER_CONCURRENCY:-4}"]
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 from typing import Literal
 
@@ -16,6 +17,33 @@ logger = logging.getLogger("ocr")
 class ExtractionField(BaseModel):
     name: str
     description: str = ""
+    public_description: str = ""
+    type: Literal["string", "number", "integer", "boolean", "object", "array"] = "string"
+    fields: list["ExtractionField"] = Field(default_factory=list)
+
+
+def validate_field_tree(fields, depth=1):
+    names = [field.name for field in fields]
+    if depth > 6 or not names or any(not name.strip() or name != name.strip() for name in names) or len(names) != len(set(names)):
+        raise ValueError("Укажите непустые уникальные имена полей; максимум 6 уровней вложенности")
+    for field in fields:
+        if field.type in {"object", "array"}:
+            validate_field_tree(field.fields, depth + 1)
+        elif field.fields:
+            raise ValueError("Вложенные поля допустимы только у объекта или списка объектов")
+
+
+def fields_schema(fields, public=False):
+    properties = {}
+    for field in fields:
+        schema = {"type": [field.type, "null"], "description": field.public_description if public else (field.description or field.public_description)}
+        if field.type == "object":
+            schema.update(fields_schema(field.fields, public))
+            schema["type"] = ["object", "null"]
+        elif field.type == "array":
+            schema["items"] = fields_schema(field.fields, public)
+        properties[field.name] = schema
+    return {"type": "object", "properties": properties, "required": [field.name for field in fields], "additionalProperties": False}
 
 
 class OCR(BaseModel):
@@ -48,9 +76,7 @@ class Extraction(BaseModel):
         if self.prompt_enabled is True and not self.prompt.strip():
             raise ValueError("Укажите промпт")
         if self.use_fields:
-            names = [field.name for field in self.fields]
-            if not names or any(not name.strip() for name in names) or len(names) != len(set(names)):
-                raise ValueError("Укажите непустые уникальные имена полей извлечения")
+            validate_field_tree(self.fields)
         return self
 
     @property
@@ -68,9 +94,25 @@ class Extraction(BaseModel):
 
 class Pipeline(BaseModel):
     name: str = "Untitled"
+    description: str = ""
+    priority: int = Field(default=5, ge=0, le=9, strict=True)
+    allow_sync: bool = True
+    allow_async: bool = True
+    async_concurrency: int = Field(default=1, ge=1, le=30, strict=True)
     source: Literal["scans", "document"]
     ocr: OCR | None = None
     extraction: Extraction | None = None
+
+    @model_validator(mode="after")
+    def at_least_one_execution_mode(self):
+        if not self.allow_sync and not self.allow_async:
+            raise ValueError("Разрешите хотя бы один режим выполнения")
+        return self
+
+
+def result_schema(pipeline):
+    extraction = pipeline.extraction
+    return fields_schema(extraction.fields, public=True) if extraction and extraction.use_fields else {"type": "string"}
 
 
 SERVICE_TEXT_KEYS = ("page_content", "text", "result")
@@ -210,15 +252,10 @@ async def extract(client, extraction, text):
     if not extraction.active:
         return text
     structured = extraction.use_fields
-    schema = {
-        "type": "object",
-        "properties": {field.name: {"type": ["string", "null"], "description": field.description} for field in extraction.fields},
-        "required": [field.name for field in extraction.fields],
-        "additionalProperties": False,
-    }
+    schema = fields_schema(extraction.fields)
     instruction = extraction.prompt if extraction.use_prompt else ""
     if structured:
-        instruction += "\nИзвлеки значения полей документа согласно JSON Schema. Верни все заданные поля; значения — строки. Если значение не найдено, верни null. Не придумывай отсутствующие данные."
+        instruction += "\nИзвлеки значения полей документа согласно JSON Schema. Соблюдай типы данных и вложенную структуру. Верни все заданные поля. Если значение не найдено, верни null; для явно пустого списка — []. Не придумывай отсутствующие данные."
     result = await complete(client, {
         "model": extraction.model, "temperature": extraction.temperature, "max_tokens": extraction.max_tokens,
         **({"response_format": {"type": "json_schema", "json_schema": {"name": "document_fields", "strict": True, "schema": schema}}} if structured else {}),
@@ -233,8 +270,7 @@ async def extract(client, extraction, text):
 
 
 def validate_extracted_fields(result, schema):
-    # The generated schema is flat and permits only string/null values. Validate
-    # it locally too: a gateway may ignore the provider's response_format.
+    # Validate recursively as gateways may ignore response_format.
     def unique_object(pairs):
         obj = {}
         for key, value in pairs:
@@ -243,14 +279,36 @@ def validate_extracted_fields(result, schema):
             obj[key] = value
         return obj
 
+    def validate(value, node):
+        types = node["type"] if isinstance(node["type"], list) else [node["type"]]
+        if value is None and "null" in types:
+            return
+        kind = types[0]
+        if kind == "object":
+            if not isinstance(value, dict) or set(value) != set(node["required"]):
+                raise ValueError("Incorrect field names")
+            for name, child in node["properties"].items():
+                validate(value[name], child)
+        elif kind == "array":
+            if not isinstance(value, list):
+                raise ValueError("Expected array")
+            for item in value:
+                validate(item, node["items"])
+        elif kind == "string" and isinstance(value, str):
+            return
+        elif kind == "boolean" and type(value) is bool:
+            return
+        elif kind in {"integer", "number"} and type(value) in {int, float} and math.isfinite(value):
+            if kind == "integer" and value != int(value):
+                raise ValueError("Expected integer")
+        else:
+            raise ValueError("Incorrect field type")
+
     try:
         value = json.loads(result, object_pairs_hook=unique_object)
-        if not isinstance(value, dict) or set(value) != set(schema["required"]):
-            raise ValueError("Incorrect field names")
-        if any(item is not None and not isinstance(item, str) for item in value.values()):
-            raise ValueError("Incorrect field type")
-    except (ValueError, TypeError) as error:
-        raise HTTPException(502, "Ответ модели не соответствует JSON Schema: нужны все заданные поля, без лишних, со значениями строка или null.") from error
+        validate(value, schema)
+    except (ValueError, TypeError, OverflowError, RecursionError) as error:
+        raise HTTPException(502, "Ответ модели не соответствует JSON Schema: проверьте поля, типы данных и вложенную структуру.") from error
 
 
 def result_fields(result):

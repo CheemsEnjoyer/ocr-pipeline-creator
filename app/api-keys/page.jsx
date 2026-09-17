@@ -14,6 +14,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { usePipelines } from "@/hooks/use-pipelines";
 import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel } from "@/components/ui/alert-dialog";
 
+const PERMISSIONS = [["run", "Запуск обработки", "Загрузка документов и повтор задач"], ["results", "Чтение результатов", "Текст, результат документа и статус задачи по ID"], ["history", "Чтение истории", "Список документов клиента без содержимого"]];
 const PAGE_SIZE = 20;
 const STATUSES = [["active", "Активные"], ["revoked", "Отозванные"], ["all", "Все"]];
 const SORTS = [["newest", "Сначала новые"], ["oldest", "Сначала старые"], ["name", "По названию"]];
@@ -40,6 +41,8 @@ async function api(url, method = "GET", body, signal) {
 export default function APIKeysPage() {
   const { pipelines, ready, error: pipelineError } = usePipelines();
   const [keys, setKeys] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [editingClient, setEditingClient] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -56,7 +59,7 @@ export default function APIKeysPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    api("/api/keys", "GET", undefined, controller.signal).then((data) => setKeys(data.keys))
+    Promise.all([api("/api/keys", "GET", undefined, controller.signal), api("/api/clients", "GET", undefined, controller.signal)]).then(([keyData, clientData]) => { setKeys(keyData.keys); setClients(clientData.clients); })
       .catch((error) => { if (error.name !== "AbortError") setError(error.message); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
@@ -70,7 +73,7 @@ export default function APIKeysPage() {
   const visible = useMemo(() => {
     const needle = normalize(query);
     const matches = keys.filter((key) => (status === "all" || (status === "active") === !key.revoked_at)
-      && (!needle || [key.name, key.prefix, ...key.pipeline_ids.map((id) => names.get(id) ?? "")].some((text) => normalize(text).includes(needle))));
+      && (!needle || [key.name, key.client_name, key.prefix, ...key.pipeline_ids.map((id) => names.get(id) ?? "")].some((text) => normalize(text).includes(needle))));
     const order = {
       newest: (a, b) => b.created_at.localeCompare(a.created_at),
       oldest: (a, b) => a.created_at.localeCompare(b.created_at),
@@ -81,7 +84,7 @@ export default function APIKeysPage() {
   const pages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const current = Math.min(page, pages - 1);
   const rows = visible.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE);
-  const canCreate = ready && !pipelineError;
+  const canCreate = ready && !pipelineError && !loading && !error;
 
   const filter = (change) => { change(); setPage(0); };
   const saved = (key, token) => {
@@ -96,6 +99,11 @@ export default function APIKeysPage() {
       setSecret(token);
       setCopied(false);
     }
+  };
+  const clientSaved = (client) => {
+    setClients((list) => list.some((item) => item.id === client.id) ? list.map((item) => item.id === client.id ? client : item) : [client, ...list]);
+    setKeys((list) => list.map((key) => key.client_id === client.id ? { ...key, client_name: client.name, pipeline_ids: client.pipeline_ids } : key));
+    setEditingClient(null);
   };
   const revoke = async () => {
     setBusy(true);
@@ -116,13 +124,20 @@ export default function APIKeysPage() {
   return <main className="app-shell"><Header subtitle="API-ключи"/>
     <div className="api-keys-page">
       <div className="pipelines-heading">
-        <div><h1>Доступ к API</h1><p>Отдельный ключ для каждой интеграции — с доступом только к выбранным пайплайнам.</p></div>
+        <div><h1>Доступ к API</h1><p>Документы принадлежат клиенту. Его ключи используют общие пайплайны и отдельные права доступа.</p></div>
         <div className="api-keys-heading-actions">
+          <Button variant="outline" disabled={!canCreate} onClick={() => setEditingClient({})}><Plus size={16}/>Новый клиент</Button>
           <Button variant="outline" disabled={busy} onClick={logout}><LogOut size={16}/>Выйти</Button>
-          <Button disabled={!canCreate} onClick={() => setEditing({})}><Plus size={16}/>Новый ключ</Button>
+          <Button disabled={!canCreate || !clients.length} onClick={() => setEditing({})}><Plus size={16}/>Новый ключ</Button>
         </div>
       </div>
       {(error || pipelineError) && <p className="history-error" role="alert">{error || pipelineError}</p>}
+
+      <section className="api-keys-panel client-panel" aria-label="Клиенты">
+        <div className="api-keys-toolbar"><h2>Клиенты</h2><small>Изменение пайплайнов применяется ко всем ключам клиента, включая доступ к старым результатам.</small></div>
+        {!loading && !clients.length && <div className="history-empty"><p>Сначала создайте клиента и выберите его пайплайны.</p><Button disabled={!canCreate} onClick={() => setEditingClient({})}>Создать клиента</Button></div>}
+        <div className="client-list">{clients.map((client) => <div className="client-row" key={client.id}><div><strong>{client.name}</strong><small>{client.pipeline_ids.length} {plural(client.pipeline_ids.length, PIPELINE_FORMS)} · {keys.filter((key) => key.client_id === client.id && !key.revoked_at).length} активных ключей</small><code>{client.id}</code></div><Button variant="outline" size="sm" onClick={() => setEditingClient(client)}>Изменить доступ</Button></div>)}</div>
+      </section>
 
       <section className="api-keys-panel" aria-label="API-ключи">
         <div className="api-keys-toolbar">
@@ -141,8 +156,8 @@ export default function APIKeysPage() {
         {loading && <p className="history-loading" role="status">Загружаем ключи…</p>}
         {!loading && !keys.length && !error && <div className="history-empty">
           <KeyRound size={32}/><strong>API-ключей пока нет</strong>
-          <p>Создайте ключ для первой интеграции и выберите пайплайны, которые ей доступны.</p>
-          <Button disabled={!canCreate} onClick={() => setEditing({})}><Plus size={16}/>Новый ключ</Button>
+          <p>Создайте ключ для клиента и выберите разрешённые действия.</p>
+          <Button disabled={!canCreate || !clients.length} onClick={() => setEditing({})}><Plus size={16}/>Новый ключ</Button>
         </div>}
         {!loading && keys.length > 0 && !visible.length && <div className="history-empty">
           <Search size={28}/><strong>Ничего не найдено</strong>
@@ -172,12 +187,14 @@ export default function APIKeysPage() {
         <ul>
           <li><code>GET /api/v1/pipelines</code> — пайплайны, доступные ключу;</li>
           <li><code>POST /api/v1/pipelines/ID/run</code> — обработка документа из поля формы <code>file</code>;</li>
-          <li><code>GET /api/v1/documents</code> и <code>GET /api/v1/documents/ID</code> — документы, обработанные этим ключом.</li>
+          <li><code>GET /api/v1/documents</code> и <code>GET /api/v1/documents/ID</code> — документы клиента в разрешённых пайплайнах; нужны соответствующие права ключа.</li>
         </ul>
       </details>
     </div>
 
-    {editing && <KeyDialog key={editing.id ?? "new"} apiKey={editing.id ? editing : null} pipelines={pipelines} onClose={() => setEditing(null)} onSaved={saved}/>}
+    {editing && <KeyDialog key={editing.id ?? "new"} apiKey={editing.id ? editing : null} clients={clients} onClose={() => setEditing(null)} onSaved={saved}/>}
+
+    {editingClient && <ClientDialog key={editingClient.id ?? "new-client"} client={editingClient.id ? editingClient : null} pipelines={pipelines} onClose={() => setEditingClient(null)} onSaved={clientSaved}/>}
 
     <AlertDialog open={Boolean(secret)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>API-ключ создан</AlertDialogTitle><AlertDialogDescription>Скопируйте ключ сейчас. Повторно посмотреть его нельзя — можно только создать новый.</AlertDialogDescription></AlertDialogHeader>
       <Input aria-label="Новый API-ключ" value={secret} readOnly onFocus={(event) => event.target.select()}/>
@@ -196,7 +213,7 @@ function KeyRow({ apiKey, names, busy, onEdit, onRevoke }) {
   const preview = [known.slice(0, 2).join(", ") + (known.length > 2 ? ` и ещё ${known.length - 2}` : ""), missing ? `удалено: ${missing}` : ""].filter(Boolean).join(" · ");
   const count = apiKey.pipeline_ids.length;
   return <TableRow className={apiKey.revoked_at ? "revoked" : undefined}>
-    <TableCell data-label="Интеграция"><div className="api-key-name"><strong title={apiKey.name}>{apiKey.name}</strong><code>{apiKey.prefix}…</code></div></TableCell>
+    <TableCell data-label="Интеграция"><div className="api-key-name"><strong title={apiKey.name}>{apiKey.name}</strong><small>Клиент: {apiKey.client_name}</small><code>{apiKey.prefix}…</code><small>{PERMISSIONS.filter(([id]) => apiKey.permissions.includes(id)).map(([, title]) => title).join(" · ") || "Все действия отключены"}</small></div></TableCell>
     <TableCell data-label="Пайплайны"><div className="api-key-pipelines" title={[...known, ...(missing ? [`удалено: ${missing}`] : [])].join("\n")}>
       <span>{count} {plural(count, PIPELINE_FORMS)}</span><small>{preview}</small>
     </div></TableCell>
@@ -211,14 +228,14 @@ function KeyRow({ apiKey, names, busy, onEdit, onRevoke }) {
   </TableRow>;
 }
 
-function KeyDialog({ apiKey, pipelines, onClose, onSaved }) {
+function ClientDialog({ client, pipelines, onClose, onSaved }) {
   const available = useMemo(() => new Set(pipelines.map((pipeline) => pipeline.id)), [pipelines]);
-  const [name, setName] = useState(apiKey?.name ?? "");
-  const [ids, setIds] = useState(() => (apiKey?.pipeline_ids ?? []).filter((id) => available.has(id)));
+  const [name, setName] = useState(client?.name ?? "");
+  const [ids, setIds] = useState(() => (client?.pipeline_ids ?? []).filter((id) => available.has(id)));
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const missing = (apiKey?.pipeline_ids ?? []).filter((id) => !available.has(id)).length;
+  const missing = (client?.pipeline_ids ?? []).filter((id) => !available.has(id)).length;
   const needle = normalize(search);
   const shown = needle ? pipelines.filter((pipeline) => normalize(pipelineName(pipeline)).includes(needle)) : pipelines;
   const selected = new Set(ids);
@@ -232,8 +249,8 @@ function KeyDialog({ apiKey, pipelines, onClose, onSaved }) {
     setBusy(true);
     setError("");
     try {
-      const data = await api(apiKey ? `/api/keys/${apiKey.id}` : "/api/keys", apiKey ? "PATCH" : "POST", { name: name.trim(), pipeline_ids: ids });
-      onSaved(data.key, data.token);
+      const data = await api(client ? `/api/clients/${client.id}` : "/api/clients", client ? "PATCH" : "POST", { name: name.trim(), pipeline_ids: ids });
+      onSaved(data.client);
     } catch (error) { setError(error.message); setBusy(false); }
   };
 
@@ -241,12 +258,12 @@ function KeyDialog({ apiKey, pipelines, onClose, onSaved }) {
     <DialogContent className="api-key-dialog sm:max-w-[560px]">
       <form className="api-key-dialog-form" onSubmit={submit}>
         <DialogHeader>
-          <DialogTitle>{apiKey ? "Доступ ключа" : "Новый API-ключ"}</DialogTitle>
-          <DialogDescription>{apiKey ? `Ключ ${apiKey.prefix}… останется прежним — меняются только название и пайплайны.` : "Ключ покажем один раз сразу после создания."}</DialogDescription>
+          <DialogTitle>{client ? "Доступ клиента" : "Новый клиент"}</DialogTitle>
+          <DialogDescription>{"Пайплайны доступны всем ключам клиента. Снятие разрешения закроет и старые результаты; документы сохранятся."}</DialogDescription>
         </DialogHeader>
         <div className="api-key-field">
-          <Label htmlFor="key-name">Название интеграции</Label>
-          <Input id="key-name" placeholder="Например, 1С: Бухгалтерия" value={name} maxLength={120} disabled={busy} required autoFocus onChange={(event) => setName(event.target.value)}/>
+          <Label htmlFor="client-name">Название клиента</Label>
+          <Input id="client-name" placeholder="Например, Компания Альфа" value={name} maxLength={120} disabled={busy} required autoFocus onChange={(event) => setName(event.target.value)}/>
         </div>
         <fieldset className="api-key-field" disabled={busy}>
           <legend>Доступные пайплайны<span>Выбрано {ids.length} из {pipelines.length}</span></legend>
@@ -263,14 +280,42 @@ function KeyDialog({ apiKey, pipelines, onClose, onSaved }) {
             {!pipelines.length && <p>Сначала создайте пайплайн в конструкторе.</p>}
             {pipelines.length > 0 && !shown.length && <p>Пайплайнов с таким названием нет.</p>}
           </div>
-          {missing > 0 && <small>Удалённые пайплайны ({missing}) будут убраны из ключа при сохранении.</small>}
+          {missing > 0 && <small>Удалённые пайплайны ({missing}) будут убраны из доступа клиента при сохранении.</small>}
         </fieldset>
         {error && <p className="history-error" role="alert">{error}</p>}
         <DialogFooter>
           <Button type="button" variant="outline" disabled={busy} onClick={onClose}>Отмена</Button>
-          <Button type="submit" disabled={busy || !name.trim() || !ids.length}>{busy ? "Сохраняем…" : apiKey ? "Сохранить доступ" : "Создать ключ"}</Button>
+          <Button type="submit" disabled={busy || !name.trim()}>{busy ? "Сохраняем…" : client ? "Сохранить доступ" : "Создать клиента"}</Button>
         </DialogFooter>
       </form>
     </DialogContent>
   </Dialog>;
+}
+
+
+function KeyDialog({ apiKey, clients, onClose, onSaved }) {
+  const [name, setName] = useState(apiKey?.name ?? "");
+  const [clientId, setClientId] = useState(apiKey?.client_id ?? "");
+  const [permissions, setPermissions] = useState(apiKey?.permissions ?? ["run", "results"]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true); setError("");
+    try {
+      const data = await api(apiKey ? `/api/keys/${apiKey.id}` : "/api/keys", apiKey ? "PATCH" : "POST", { name: name.trim(), client_id: clientId, permissions });
+      onSaved(data.key, data.token);
+    } catch (error) { setError(error.message); setBusy(false); }
+  };
+  return <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose(); }}><DialogContent className="api-key-dialog sm:max-w-[560px]">
+    <form className="api-key-dialog-form" onSubmit={submit}>
+      <DialogHeader><DialogTitle>{apiKey ? "Доступ ключа" : "Новый API-ключ"}</DialogTitle><DialogDescription>Ключ получает доступ к документам выбранного клиента. Для замены ключа выберите того же клиента — история сохранится.</DialogDescription></DialogHeader>
+      <div className="api-key-field"><Label htmlFor="key-name">Название ключа</Label><Input id="key-name" value={name} onChange={(event) => setName(event.target.value)} required maxLength={120} disabled={busy} autoFocus placeholder="Например, CRM — основной сервер"/></div>
+      <div className="api-key-field"><Label htmlFor="key-client">Клиент</Label><NativeSelect id="key-client" value={clientId} onChange={(event) => setClientId(event.target.value)} disabled={busy || Boolean(apiKey)} required><NativeSelectOption value="">Выберите клиента</NativeSelectOption>{clients.map((client) => <NativeSelectOption key={client.id} value={client.id}>{client.name} · {client.id.slice(0, 8)}</NativeSelectOption>)}</NativeSelect><small>{apiKey ? "Владелец ключа не меняется. Для другого клиента создайте новый ключ." : "Для разных клиентов используйте отдельные ключи."}</small></div>
+      <fieldset className="api-key-field" disabled={busy}><legend>Разрешённые действия</legend><div className="key-pipeline-list">{PERMISSIONS.map(([id, title, copy]) => <label key={id}><Checkbox checked={permissions.includes(id)} onCheckedChange={(checked) => setPermissions((current) => checked ? [...new Set([...current, id])] : current.filter((item) => item !== id))}/><span>{title}<small className="permission-copy">{copy}</small></span></label>)}</div><small>Без чтения результатов запуск возвращает только ID документа. Статус фоновой задачи требует права чтения результатов.</small></fieldset>
+      {error && <p className="history-error" role="alert">{error}</p>}
+      <DialogFooter><Button type="button" variant="outline" disabled={busy} onClick={onClose}>Отмена</Button><Button type="submit" disabled={busy || !name.trim() || !clientId}>{busy ? "Сохраняем…" : apiKey ? "Сохранить" : "Создать ключ"}</Button></DialogFooter>
+    </form>
+  </DialogContent></Dialog>;
 }

@@ -2,9 +2,10 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import or_, select, update
+from fastapi import HTTPException
+from sqlalchemy import delete, func, or_, select, update
 
-from .models import Document, ProcessingJob, TaskOutbox
+from .models import Document, IntegrationClient, ProcessingCapacity, ProcessingJob, SavedPipeline, SyncProcessingSlot, TaskOutbox
 
 
 def now():
@@ -12,7 +13,24 @@ def now():
 
 
 def add_outbox(session, job):
-    session.add(TaskOutbox(id=str(uuid4()), job_id=job.id, generation=job.generation or 0, next_attempt_at=job.next_run_at or 0))
+    session.add(TaskOutbox(id=str(uuid4()), job_id=job.id, generation=job.generation or 0,
+                           priority=job.priority, next_attempt_at=job.next_run_at or 0))
+
+
+def ensure_client_job_capacity(session, client_id, limit, exclude_job_id=None):
+    if client_id is None:
+        return
+    # One client-row lock serializes submissions from every key and API instance.
+    if session.scalar(select(IntegrationClient.id).where(IntegrationClient.id == client_id).with_for_update()) is None:
+        raise HTTPException(401, "Клиент API-ключа не найден")
+    query = select(func.count()).select_from(ProcessingJob).where(
+        ProcessingJob.client_id == client_id,
+        ProcessingJob.status.in_(("queued", "processing")),
+    )
+    if exclude_job_id is not None:
+        query = query.where(ProcessingJob.id != exclude_job_id)
+    if session.scalar(query) >= limit:
+        raise HTTPException(429, f"У клиента уже {limit} активных задач. Дождитесь завершения одной из них.", headers={"Retry-After": "5"})
 
 
 class DocumentRepository:
@@ -24,12 +42,42 @@ class DocumentRepository:
             session.add(document)
 
 
+class SyncCapacityRepository:
+    def __init__(self, sessions, settings):
+        self.sessions, self.settings = sessions, settings
+
+    def acquire(self, client_id=None, clock=None):
+        clock = time.time() if clock is None else clock
+        with self.sessions.begin() as session:
+            # One row serializes the global and per-client counters across API instances.
+            capacity = session.scalar(select(ProcessingCapacity).where(ProcessingCapacity.id == "sync").with_for_update())
+            if capacity is None:
+                capacity = ProcessingCapacity(id="sync")
+                session.add(capacity)
+                session.flush()
+            session.execute(delete(SyncProcessingSlot).where(SyncProcessingSlot.expires_at <= clock))
+            if session.scalar(select(func.count()).select_from(SyncProcessingSlot)) >= self.settings.sync_global_limit:
+                raise HTTPException(429, f"Одновременно обрабатывается максимум {self.settings.sync_global_limit} синхронных документов.", headers={"Retry-After": "5"})
+            if client_id is not None:
+                client_running = session.scalar(select(func.count()).select_from(SyncProcessingSlot).where(SyncProcessingSlot.client_id == client_id))
+                if client_running >= self.settings.sync_client_limit:
+                    raise HTTPException(429, f"У клиента уже {self.settings.sync_client_limit} синхронных документа в обработке.", headers={"Retry-After": "5"})
+            slot_id = str(uuid4())
+            session.add(SyncProcessingSlot(id=slot_id, client_id=client_id, expires_at=clock + self.settings.timeout + 60))
+            return slot_id
+
+    def release(self, slot_id):
+        with self.sessions.begin() as session:
+            session.execute(delete(SyncProcessingSlot).where(SyncProcessingSlot.id == slot_id))
+
+
 class JobRepository:
     def __init__(self, sessions, settings):
         self.sessions, self.settings = sessions, settings
 
     def create(self, job):
         with self.sessions.begin() as session:
+            ensure_client_job_capacity(session, job.client_id, self.settings.client_active_limit)
             session.add(job)
             add_outbox(session, job)
 
@@ -47,6 +95,25 @@ class JobRepository:
                 job.status, job.error, job.updated_at = "failed", "Превышен лимит времени или попыток обработки", now()
                 job.lease_token, job.lease_until = None, None
                 return None
+            concurrency = job.pipeline.get("async_concurrency", 1)
+            if job.pipeline_id is not None:
+                # The pipeline-row lock serializes capacity checks across workers.
+                pipeline = session.scalar(select(SavedPipeline).where(SavedPipeline.id == job.pipeline_id).with_for_update())
+                if pipeline is not None:
+                    concurrency = pipeline.config.get("async_concurrency", concurrency)
+                running = session.scalar(select(func.count()).select_from(ProcessingJob).where(
+                    ProcessingJob.pipeline_id == job.pipeline_id,
+                    ProcessingJob.status == "processing",
+                    ProcessingJob.id != job.id,
+                    ProcessingJob.lease_until > clock,
+                ))
+                if running >= concurrency:
+                    job.status = "queued"
+                    job.generation += 1
+                    job.next_run_at = clock + 1
+                    job.lease_token, job.lease_until, job.updated_at = None, None, now()
+                    add_outbox(session, job)
+                    return None
             job.status, job.lease_token = "processing", str(uuid4())
             job.lease_until = clock + self.settings.lease
             job.deadline_at = job.deadline_at or clock + self.settings.timeout

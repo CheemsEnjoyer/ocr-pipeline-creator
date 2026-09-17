@@ -40,3 +40,9 @@ class SecurityTests(unittest.TestCase):
         with patch.dict("os.environ", {"OCR_TASK_SOFT_LIMIT_SECONDS": "300", "OCR_TASK_HARD_LIMIT_SECONDS": "200"}):
             with self.assertRaises(RuntimeError):
                 JobSettings.from_env()
+        with patch.dict("os.environ", {"OCR_GLOBAL_SYNC_LIMIT": "3", "OCR_CLIENT_SYNC_LIMIT": "4"}):
+            with self.assertRaises(RuntimeError):
+                JobSettings.from_env()
+        with patch.dict("os.environ", {}, clear=True):
+            settings = JobSettings.from_env()
+        self.assertEqual((settings.sync_global_limit, settings.sync_client_limit), (10, 4))

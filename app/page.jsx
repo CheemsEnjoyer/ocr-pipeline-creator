@@ -22,6 +22,7 @@ export default function ProcessPage() {
   const isAdmin = useSession()?.role === "admin";
   const { pipelines, ready, error: pipelineError } = usePipelines();
   const [pipelineId, setPipelineId] = useState("");
+  const [runMode, setRunMode] = useState("async");
   const [items, setItems] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [running, setRunning] = useState(false);
@@ -30,6 +31,9 @@ export default function ProcessPage() {
   useEffect(() => () => runController.current?.abort(), []);
 
   const pipeline = useMemo(() => pipelines.find((item) => item.id === pipelineId) ?? pipelines[0] ?? null, [pipelines, pipelineId]);
+  const allowSync = pipeline?.allow_sync !== false;
+  const allowAsync = pipeline?.allow_async !== false;
+  const selectedRunMode = (runMode === "sync" && allowSync) || (runMode === "async" && allowAsync) ? runMode : allowAsync ? "async" : "sync";
   const summary = pipeline ? describePipeline(pipeline) : null;
   const canRun = Boolean(pipeline) && items.some((item) => item.status !== "done") && !running;
 
@@ -51,14 +55,18 @@ export default function ProcessPage() {
         if (!taskId) {
           const body = new FormData();
           body.append("file", item.file);
-          body.append("pipeline", JSON.stringify(pipeline));
-          const response = await fetch("/api/pipeline/run?background=true", { method: "POST", body, signal: controller.signal });
+          body.append("pipeline_id", pipeline.id);
+          const background = selectedRunMode === "async";
+          const response = await fetch(`/api/pipeline/run?background=${background}`, { method: "POST", body, signal: controller.signal });
           const data = await response.json();
-          if (!response.ok && !data.taskId) throw new Error(data.error || "Обработка не удалась");
+          if (!response.ok) throw new Error(data.error || "Обработка не удалась");
+          if (!background) {
+            patch(item.id, { status: "done", result: data.result, documentId: data.documentId });
+            return;
+          }
           taskId = data.taskId;
           if (!taskId) throw new Error("Сервер не вернул ID задачи");
           patch(item.id, { taskId });
-          if (!response.ok) throw new Error(data.error || "Очередь обработки недоступна");
         }
         const result = await waitForJob(`/api/jobs/${encodeURIComponent(taskId)}`, { signal: controller.signal });
         patch(item.id, { status: "done", result: result.result, documentId: result.documentId });
@@ -122,7 +130,10 @@ export default function ProcessPage() {
             <div><span>Источник</span><strong>{pipeline.source === "scans" ? "Сканы / изображения" : "Цифровой документ"}</strong></div>
             <div><span>Распознавание</span><strong>{summary.ocr}</strong></div>
             <div><span>Извлечение</span><strong>{summary.extraction}</strong></div>
+            {allowAsync && <div><span>Параллельно в Celery</span><strong>До {pipeline.async_concurrency ?? 1}</strong></div>}
           </div>}
+
+          {allowSync && allowAsync ? <div className="main-field"><label htmlFor="run-mode">Режим запуска</label><Select value={selectedRunMode} onValueChange={setRunMode} disabled={running}><SelectTrigger id="run-mode"><SelectValue/></SelectTrigger><SelectContent><SelectItem value="sync">Синхронно</SelectItem><SelectItem value="async">Асинхронно через Celery</SelectItem></SelectContent></Select></div> : <p className="run-hint">Режим: {allowAsync ? "асинхронно через Celery" : "синхронно"}</p>}
 
           <Button className="run-button" onClick={run} disabled={!canRun}>{running ? <><LoaderCircle size={16} className="spin"/>Обрабатываем…</> : <><Play size={16}/>Обработать {items.length || ""}</>}</Button>
           {!items.length && <p className="run-hint">Добавьте хотя бы один документ.</p>}

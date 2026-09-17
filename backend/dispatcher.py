@@ -20,7 +20,7 @@ def dispatch_once(sessions, settings=None, publisher=enqueue_job, limit=100):
         if event is None:
             break
         try:
-            publisher(event.job_id, event.generation, event.id)
+            publisher(event.job_id, event.generation, event.id, event.priority)
         except Exception as error:
             logger.warning("Не удалось отправить событие %s: %s", event.id, type(error).__name__)
             repository.finish(event, False)

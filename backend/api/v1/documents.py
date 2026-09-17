@@ -1,23 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import false, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import load_only
-from ...access import integration_allowed
+from ...access import integration_allowed, require_permission, client_visible
 from ...models import Document
-from ...schemas import serialize
+from ...schemas import serialize, public_result
 
 
 def create_router(app, storage, policy=integration_allowed):
     router = APIRouter(tags=["Documents"])
     def visible_documents(request):
-        # Администратор видит всю историю, ключ интеграции — только документы, которые обработал сам.
-        query = select(Document)
-        if request.state.user_id:
-            return query
-        return query.where(Document.api_key_id == request.state.api_key_id) if request.state.api_key_id else query.where(false())
+        return client_visible(select(Document), Document, request)
 
     @router.get("/documents", dependencies=[Depends(policy)])
     def documents(request: Request, page: int = Query(default=0, ge=0), pipeline_id: str | None = Query(default=None),
                   page_size: int = Query(default=50, ge=1, le=100), q: str = Query(default="", max_length=200)):
+        require_permission(request, "history")
         with app.state.sessions() as session:
             query = visible_documents(request)
             if pipeline_id is not None:
@@ -31,10 +28,14 @@ def create_router(app, storage, policy=integration_allowed):
 
     @router.get("/documents/{document_id}", dependencies=[Depends(policy)])
     def document(document_id: str, request: Request):
+        require_permission(request, "results")
         with app.state.sessions() as session:
             row = session.scalar(visible_documents(request).where(Document.id == document_id))
             if row is None:
                 raise HTTPException(404, "Документ не найден")
-            return {"document": serialize(row, detail=True)}
+            payload = serialize(row, detail=True)
+            if request.url.path.startswith("/api/v1/"):
+                payload["result"] = public_result(row)
+            return {"document": payload}
 
     return router

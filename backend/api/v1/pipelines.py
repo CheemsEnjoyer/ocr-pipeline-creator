@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from ...access import integration_allowed
 from ...models import SavedPipeline
-from ...schemas import serialize_pipeline
+from ...schemas import serialize_pipeline, serialize_public_pipeline
 
 
 def create_router(app, storage):
@@ -14,6 +14,7 @@ def create_router(app, storage):
             if not request.state.user_id:
                 query = query.where(SavedPipeline.id.in_(request.state.pipeline_ids))
             rows = session.scalars(query.order_by(SavedPipeline.updated_at.desc(), SavedPipeline.id))
-            return {"pipelines": [serialize_pipeline(row) for row in rows]}
+            serializer = serialize_public_pipeline if request.url.path.startswith("/api/v1/") or not request.state.user_id else serialize_pipeline
+            return {"pipelines": [serializer(row) for row in rows]}
 
     return router

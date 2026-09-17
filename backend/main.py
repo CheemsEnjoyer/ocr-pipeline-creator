@@ -95,7 +95,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
 
     @app.exception_handler(HTTPException)
     async def http_error(_request, error):
-        return JSONResponse({"error": redact(error.detail)}, status_code=error.status_code)
+        return JSONResponse({"error": redact(error.detail)}, status_code=error.status_code, headers=error.headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request, _error):

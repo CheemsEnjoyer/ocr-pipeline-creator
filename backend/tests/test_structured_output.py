@@ -6,7 +6,7 @@ import httpx
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from backend.processing import Extraction, extract
+from backend.processing import Extraction, extract, fields_schema
 
 
 class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
@@ -106,3 +106,46 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
         for fields in ([], [{"name": " "}], [{"name": "total"}, {"name": "total"}]):
             with self.subTest(fields=fields), self.assertRaises(ValidationError):
                 Extraction(mode="fields", model="extract", fields=fields)
+
+    async def test_nested_typed_result_and_public_descriptions(self):
+        self.extraction = Extraction(model="extract", fields=[{
+            "name": "objects", "type": "array", "description": "PRIVATE RULE", "public_description": "Информация об объектах",
+            "fields": [
+                {"name": "name"}, {"name": "price", "type": "number"},
+                {"name": "count", "type": "integer"}, {"name": "active", "type": "boolean"},
+                {"name": "address", "type": "object", "fields": [{"name": "city"}]},
+            ],
+        }])
+        content = json.dumps({"objects": [{"name": "House", "price": 12.5, "count": 2, "active": False, "address": {"city": None}}]})
+        self.assertEqual(await self.request(content), content)
+        self.assertEqual(await self.request('{"objects": []}'), '{"objects": []}')
+        self.assertEqual(await self.request('{"objects": null}'), '{"objects": null}')
+        public = fields_schema(self.extraction.fields, public=True)
+        self.assertNotIn("PRIVATE RULE", json.dumps(public))
+        self.assertEqual(public["properties"]["objects"]["description"], "Информация об объектах")
+        for invalid in [
+            {"objects": [None]}, {"objects": [{}]}, {"objects": {}},
+            {"objects": [{"name": "x", "price": True, "count": 1, "active": False, "address": None}]},
+            {"objects": [{"name": "x", "price": 1, "count": 1.5, "active": False, "address": None}]},
+            {"objects": [{"name": "x", "price": float("nan"), "count": 1, "active": False, "address": None}]},
+            {"objects": [{"name": "x", "price": 1, "count": 1, "active": "false", "address": None}]},
+            {"objects": [{"name": "x", "price": 1, "count": 1, "active": False, "address": {"city": "X", "extra": 1}}]},
+        ]:
+            with self.subTest(invalid=invalid), self.assertRaises(HTTPException):
+                await self.request(json.dumps(invalid))
+
+    def test_invalid_nested_configuration(self):
+        for field in [
+            {"name": "x", "type": "array"},
+            {"name": "x", "type": "object", "fields": [{"name": "a"}, {"name": "a"}]},
+            {"name": "x", "type": "object", "fields": [{"name": " "}]},
+            {"name": "x", "type": "number", "fields": [{"name": "a"}]},
+            {"name": "x", "type": "unknown"},
+        ]:
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                Extraction(model="extract", fields=[field])
+        field = {"name": "leaf"}
+        for _ in range(6):
+            field = {"name": "parent", "type": "object", "fields": [field]}
+        with self.assertRaises(ValidationError):
+            Extraction(model="extract", fields=[field])

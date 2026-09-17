@@ -32,5 +32,5 @@ def process_document(job_id, generation=None):
         engine.dispose()
 
 
-def enqueue_job(job_id, generation=0, event_id=None):
-    process_document.apply_async(args=[job_id, generation], task_id=event_id or job_id, retry=False)
+def enqueue_job(job_id, generation=0, event_id=None, priority=5):
+    process_document.apply_async(args=[job_id, generation], task_id=event_id or job_id, retry=False, priority=priority)

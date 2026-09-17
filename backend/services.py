@@ -11,18 +11,20 @@ from sqlalchemy.exc import OperationalError
 
 from .config import JobSettings
 from .models import Document, ProcessingJob
-from .processing import extract, recognize, result_fields
-from .repositories import DocumentRepository, JobRepository, now
+from .processing import extract, recognize, result_fields, result_schema
+from .repositories import DocumentRepository, JobRepository, SyncCapacityRepository, now
 from .security import redact, safe_url
+from .task_service import TaskService
 
 
-def build_document(document_id, original_key, filename, mime, size, parsed, text, result, pipeline_id, api_key_id):
+def build_document(document_id, original_key, filename, mime, size, parsed, text, result, pipeline_id, api_key_id, client_id=None):
     timestamp = now()
     return Document(
         id=document_id, filename=filename, mime_type=mime, size=size, pipeline_name=parsed.name,
         original_key=original_key, text=text, result=result,
-        fields={} if parsed.extraction and parsed.extraction.mode == "prompt" else result_fields(result),
-        created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id,
+        fields={} if parsed.extraction and not parsed.extraction.use_fields else result_fields(result),
+        result_schema=result_schema(parsed),
+        created_at=timestamp, updated_at=timestamp, revision=0, pipeline_id=pipeline_id, api_key_id=api_key_id, client_id=client_id,
     )
 
 
@@ -77,6 +79,7 @@ class ProcessingService:
         self.settings = settings or JobSettings.from_env()
         self.documents = DocumentRepository(sessions)
         self.jobs = JobRepository(sessions, self.settings)
+        self.sync_capacity = SyncCapacityRepository(sessions, self.settings)
 
     def cleanup(self, key):
         try:
@@ -85,7 +88,7 @@ class ProcessingService:
             import logging
             logging.getLogger("ocr").error("Не удалось очистить исходник после ошибки базы")
 
-    async def run(self, client, content, filename, mime, parsed, pipeline_id=None, api_key_id=None):
+    async def run(self, client, content, filename, mime, parsed, pipeline_id=None, api_key_id=None, client_id=None):
         from starlette.concurrency import run_in_threadpool
         try:
             text, result = await process_pipeline(client, parsed, content, filename, mime, self.settings.timeout)
@@ -93,7 +96,7 @@ class ProcessingService:
             raise HTTPException(504, "Превышено время обработки документа") from error
         document_id = str(uuid4())
         original_key = await run_in_threadpool(self.originals.put, document_id, content, mime)
-        document = build_document(document_id, original_key, filename, mime, len(content), parsed, text, result, pipeline_id, api_key_id)
+        document = build_document(document_id, original_key, filename, mime, len(content), parsed, text, result, pipeline_id, api_key_id, client_id)
         try:
             await run_in_threadpool(self.documents.save, document)
         except Exception:
@@ -101,14 +104,14 @@ class ProcessingService:
             raise
         return {"file": filename, "text": text, "result": result, "documentId": document_id}
 
-    def submit(self, content, filename, mime, parsed, pipeline_id=None, api_key_id=None):
+    def submit(self, content, filename, mime, parsed, pipeline_id=None, api_key_id=None, client_id=None):
         job_id = str(uuid4())
         original_key = self.originals.put(job_id, content, mime)
         timestamp = now()
         job = ProcessingJob(
             id=job_id, status="queued", filename=filename, mime_type=mime, size=len(content), original_key=original_key,
-            pipeline=parsed.model_dump(mode="json"), pipeline_id=pipeline_id, api_key_id=api_key_id,
-            created_at=timestamp, updated_at=timestamp, generation=0, attempts=0, next_run_at=0,
+            pipeline=parsed.model_dump(mode="json"), pipeline_id=pipeline_id, api_key_id=api_key_id, client_id=client_id,
+            priority=parsed.priority, created_at=timestamp, updated_at=timestamp, generation=0, attempts=0, next_run_at=0,
         )
         try:
             self.jobs.create(job)
@@ -138,7 +141,7 @@ class ProcessingService:
                     return await process_pipeline(client, parsed, content, claimed.filename, claimed.mime_type, remaining)
 
             text, result = asyncio.run(process())
-            document = build_document(claimed.id, claimed.original_key, claimed.filename, claimed.mime_type, claimed.size, parsed, text, result, claimed.pipeline_id, claimed.api_key_id)
+            document = build_document(claimed.id, claimed.original_key, claimed.filename, claimed.mime_type, claimed.size, parsed, text, result, claimed.pipeline_id, claimed.api_key_id, claimed.client_id)
             self.jobs.complete(claimed, document)
         except Exception as error:
             import logging

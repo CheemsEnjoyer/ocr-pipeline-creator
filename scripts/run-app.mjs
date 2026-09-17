@@ -74,7 +74,9 @@ async function requireFreePort(port) {
 }
 
 function launchWorker() {
-  const worker = launch(python, ["-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", ...(windows ? ["--pool=solo"] : ["--concurrency=2"])]);
+  const concurrency = Number(process.env.OCR_WORKER_CONCURRENCY || 4);
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("OCR_WORKER_CONCURRENCY должен быть положительным целым числом");
+  const worker = launch(python, ["-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", ...(windows ? ["--pool=solo"] : [`--concurrency=${concurrency}`])]);
   worker.once("error", (error) => { console.error(error.message); stop(1); });
   worker.once("exit", (code) => { if (!stopping) stop(code || 1); });
   return worker;

@@ -1,5 +1,8 @@
-from sqlalchemy import JSON, Float, Index, Integer, String, Text, UniqueConstraint, CheckConstraint, ForeignKey
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from datetime import datetime, timezone
+from enum import Enum
+
+from sqlalchemy import JSON, DateTime, Enum as SAEnum, Float, Index, Integer, String, Text, UniqueConstraint, CheckConstraint, ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
 JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
@@ -7,6 +10,46 @@ JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
 class Base(DeclarativeBase):
     pass
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    ERROR = "error"
+    RESPONSE_SENDING_ERROR = "response_sending_error"
+
+
+class DocumentType(Base):
+    __tablename__ = "document_types"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    document_type_id: Mapped[int] = mapped_column(ForeignKey("document_types.id"))
+    callback_url: Mapped[str] = mapped_column(Text)
+    status: Mapped[TaskStatus] = mapped_column(
+        SAEnum(TaskStatus, native_enum=False, create_constraint=True, name="task_status"),
+        default=TaskStatus.PENDING,
+    )
+    task_update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    task_completion_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    document_type: Mapped[DocumentType] = relationship()
+    file: Mapped["File | None"] = relationship(back_populates="task", cascade="all, delete-orphan", uselist=False)
+
+
+class File(Base):
+    __tablename__ = "task_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    s3_link: Mapped[str] = mapped_column(Text)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), unique=True)
+    task: Mapped[Task] = relationship(back_populates="file")
 
 
 class Document(Base):
@@ -21,6 +64,7 @@ class Document(Base):
     original_key: Mapped[str] = mapped_column(Text)
     text: Mapped[str] = mapped_column(Text)
     result: Mapped[str] = mapped_column(Text)
+    result_schema: Mapped[dict | None] = mapped_column(JSON_TYPE, nullable=True)
     fields: Mapped[dict] = mapped_column(JSON_TYPE)
     created_at: Mapped[str] = mapped_column(String(32))
     updated_at: Mapped[str] = mapped_column(String(32))
@@ -28,6 +72,7 @@ class Document(Base):
     # Источник обработки: по api_key_id ключ интеграции видит только свои документы. У старых записей пусто.
     pipeline_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(ForeignKey("integration_clients.id"), nullable=True, index=True)
 
 
 
@@ -44,6 +89,8 @@ class ProcessingJob(Base):
     pipeline: Mapped[dict] = mapped_column(JSON_TYPE)
     pipeline_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(ForeignKey("integration_clients.id"), nullable=True, index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String(32))
     updated_at: Mapped[str] = mapped_column(String(32))
@@ -64,6 +111,7 @@ class TaskOutbox(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     job_id: Mapped[str] = mapped_column(String(36))
     generation: Mapped[int] = mapped_column(Integer)
+    priority: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     next_attempt_at: Mapped[float] = mapped_column(Float, default=0, server_default="0")
     published_at: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -88,6 +136,33 @@ class SavedPipeline(Base):
 
 
 
+class IntegrationClient(Base):
+    __tablename__ = "integration_clients"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    pipeline_ids: Mapped[list] = mapped_column(JSON_TYPE)
+    created_at: Mapped[str] = mapped_column(String(32))
+
+
+class ProcessingCapacity(Base):
+    __tablename__ = "processing_capacity"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+
+
+class SyncProcessingSlot(Base):
+    __tablename__ = "sync_processing_slots"
+    __table_args__ = (
+        Index("idx_sync_processing_slots_expires", "expires_at"),
+        Index("idx_sync_processing_slots_client", "client_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    client_id: Mapped[str | None] = mapped_column(ForeignKey("integration_clients.id"), nullable=True)
+    expires_at: Mapped[float] = mapped_column(Float)
+
+
 class APIKey(Base):
     __tablename__ = "api_keys"
 
@@ -95,7 +170,8 @@ class APIKey(Base):
     name: Mapped[str] = mapped_column(String(120))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     prefix: Mapped[str] = mapped_column(String(20))
-    pipeline_ids: Mapped[list] = mapped_column(JSON_TYPE)
+    client_id: Mapped[str] = mapped_column(ForeignKey("integration_clients.id"), index=True)
+    permissions: Mapped[list] = mapped_column(JSON_TYPE)
     created_at: Mapped[str] = mapped_column(String(32))
     revoked_at: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

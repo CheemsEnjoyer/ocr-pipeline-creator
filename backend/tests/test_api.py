@@ -156,7 +156,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(created.json()["pipeline"]["id"], config["id"])
         self.assertEqual(self.client.post("/api/pipelines", json={**config, "name": "Duplicate"}).status_code, 409)
         self.assertEqual(self.client.patch("/api/pipelines/invoices_2026", json={**config, "id": "renamed"}).status_code, 400)
-        key = self.client.post("/api/keys", json={"name": "Integration", "pipeline_ids": [config["id"]]}).json()["token"]
+        key = self.issue_key(**{"name": "Integration", "pipeline_ids": [config["id"]]}).json()["token"]
         self.client.cookies.clear()
         headers = {"Authorization": f"Bearer {key}"}
         listed = self.client.get("/api/v1/pipelines", headers=headers).json()["pipelines"]
@@ -235,6 +235,107 @@ class APITests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual([json.loads(call.content)["temperature"] for call in self.calls], [temperatures.get("ocr", 0), temperatures.get("extraction", 0)])
 
+    def test_pipeline_priority_reaches_celery_and_survives_retry(self):
+        from backend.tasks import enqueue_job, process_document
+
+        pipeline = {"source": "document", "name": "Priority", "priority": 0,
+                    "extraction": {"mode": "prompt", "model": "extract", "prompt": "Extract"}}
+        job = self.submit_background(pipeline=pipeline)
+        with self.app.state.sessions() as session:
+            row = session.get(ProcessingJob, job["taskId"])
+            event = session.scalar(select(TaskOutbox).where(TaskOutbox.job_id == row.id))
+            self.assertEqual((row.priority, event.priority, row.pipeline["priority"]), (0, 0, 0))
+        published = []
+        self.assertEqual(dispatch_once(self.app.state.sessions, publisher=lambda *args: published.append(args)), 1)
+        self.assertEqual(published[0][3], 0)
+        with patch.object(process_document, "apply_async") as apply_async:
+            enqueue_job(*published[0])
+        self.assertEqual(apply_async.call_args.kwargs["priority"], 0)
+
+        self.fail_upstream = True
+        self.execute_background(job["taskId"])
+        self.fail_upstream = False
+        self.client.post(job["statusUrl"] + "/retry")
+        with self.app.state.sessions() as session:
+            retry_event = session.scalar(select(TaskOutbox).where(TaskOutbox.job_id == job["taskId"], TaskOutbox.published_at.is_(None)))
+            self.assertEqual(retry_event.priority, 0)
+
+        for invalid in (-1, 10, 1.5, "9"):
+            with self.subTest(priority=invalid):
+                response = self.client.post("/api/pipelines", json={"id": f"priority_{str(invalid).replace('.', '_').replace('-', 'n')}", "name": "Invalid", "source": "document", "priority": invalid})
+                self.assertEqual(response.status_code, 422)
+
+    def test_pipeline_execution_modes_and_async_concurrency(self):
+        async_config = {"id": "async_limited", "name": "Async", "source": "document",
+                        "allow_sync": False, "allow_async": True, "async_concurrency": 1}
+        self.assertEqual(self.client.post("/api/pipelines", json=async_config).status_code, 201)
+        first = self.client.post("/api/pipeline/run?background=true", files={"file": ("1.txt", b"one", "text/plain")}, data={"pipeline_id": "async_limited"})
+        second = self.client.post("/api/pipeline/run?background=true", files={"file": ("2.txt", b"two", "text/plain")}, data={"pipeline_id": "async_limited"})
+        self.assertEqual((first.status_code, second.status_code), (202, 202))
+        self.assertEqual(self.client.post("/api/pipelines/async_limited/run?background=false", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
+
+        clock = 1000
+        claimed = self.app.state.processing.jobs.claim(first.json()["taskId"], clock=clock)
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(self.app.state.processing.jobs.claim(second.json()["taskId"], clock=clock))
+        with self.app.state.sessions.begin() as session:
+            delayed = session.get(ProcessingJob, second.json()["taskId"])
+            self.assertEqual((delayed.status, delayed.generation, delayed.next_run_at), ("queued", 1, clock + 1))
+            session.get(ProcessingJob, first.json()["taskId"]).status = "succeeded"
+        self.assertIsNotNone(self.app.state.processing.jobs.claim(second.json()["taskId"], generation=1, clock=clock + 2))
+
+        sync_config = {"id": "sync_only", "name": "Sync", "source": "document", "allow_sync": True, "allow_async": False}
+        self.assertEqual(self.client.post("/api/pipelines", json=sync_config).status_code, 201)
+        self.assertEqual(self.client.post("/api/pipelines/sync_only/run", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 200)
+        self.assertEqual(self.client.post("/api/pipelines/sync_only/run?background=true", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
+
+        maximum = self.client.post("/api/pipelines", json={"id": "max_concurrency", "name": "Maximum", "source": "document", "async_concurrency": 30})
+        self.assertEqual(maximum.status_code, 201, maximum.text)
+
+        for invalid in ({"allow_sync": False, "allow_async": False}, {"async_concurrency": 0}, {"async_concurrency": 31}):
+            response = self.client.post("/api/pipelines", json={"id": "invalid_modes", "name": "Invalid", "source": "document", **invalid})
+            self.assertEqual(response.status_code, 422, response.text)
+
+    def test_distributed_sync_capacity_limits_global_and_client_load(self):
+        from fastapi import HTTPException
+        from backend.models import IntegrationClient
+        from backend.repositories import SyncCapacityRepository
+
+        first_client, second_client = str(uuid4()), str(uuid4())
+        with self.app.state.sessions.begin() as session:
+            session.add_all([
+                IntegrationClient(id=first_client, name="First", pipeline_ids=[], created_at="2026"),
+                IntegrationClient(id=second_client, name="Second", pipeline_ids=[], created_at="2026"),
+            ])
+        settings = JobSettings(timeout=60, sync_global_limit=3, sync_client_limit=2)
+        capacity = SyncCapacityRepository(self.app.state.sessions, settings)
+        first = capacity.acquire(first_client, clock=1000)
+        second = capacity.acquire(first_client, clock=1000)
+        with self.assertRaises(HTTPException) as client_error:
+            capacity.acquire(first_client, clock=1000)
+        self.assertEqual((client_error.exception.status_code, client_error.exception.headers["Retry-After"]), (429, "5"))
+        third = capacity.acquire(second_client, clock=1000)
+        with self.assertRaises(HTTPException) as global_error:
+            capacity.acquire(second_client, clock=1000)
+        self.assertEqual(global_error.exception.status_code, 429)
+        capacity.release(first)
+        replacement = capacity.acquire(second_client, clock=1001)
+        # Leases left behind by a crashed API process stop counting after timeout + grace period.
+        recovered = capacity.acquire(first_client, clock=1121)
+        self.assertIsInstance(recovered, str)
+        for slot in (second, third, replacement, recovered):
+            capacity.release(slot)
+
+        live_capacity = self.app.state.processing.sync_capacity
+        occupied = [live_capacity.acquire() for _ in range(10)]
+        try:
+            blocked = self.upload(pipeline={"source": "document"})
+            self.assertEqual((blocked.status_code, blocked.headers.get("Retry-After")), (429, "5"))
+            self.assertEqual(self.calls, [])
+        finally:
+            for slot in occupied:
+                live_capacity.release(slot)
+
     def test_prompt_result_stays_text_even_if_model_returns_json(self):
         pipeline = {"source": "document", "extraction": {"mode": "prompt", "model": "extract", "prompt": "Кратко опиши документ"}}
         response = self.upload(pipeline=pipeline)
@@ -302,6 +403,13 @@ class APITests(unittest.TestCase):
         response = self.client.post("/api/pipelines", json={"id": f"test_{uuid4().hex}", "name": name, "source": "document", "extraction": None})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["pipeline"]["id"]
+
+    def issue_key(self, name, pipeline_ids, client=None):
+        admin = client or self.client
+        created = admin.post("/api/clients", json={"name": name, "pipeline_ids": pipeline_ids})
+        if created.status_code != 201:
+            return created
+        return admin.post("/api/keys", json={"name": name, "client_id": created.json()["client"]["id"], "permissions": ["run", "results", "history"]})
 
     @staticmethod
     def send_document(client, url, data=None):
@@ -393,7 +501,7 @@ class APITests(unittest.TestCase):
     def test_integration_key_is_limited_to_assigned_pipelines(self):
         allowed = self.create_pipeline("Счета")
         hidden = self.create_pipeline("Договоры")
-        created = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [allowed]})
+        created = self.issue_key(**{"name": "1С", "pipeline_ids": [allowed]})
         self.assertEqual(created.status_code, 201, created.text)
         token = created.json()["token"]
         self.assertTrue(token.startswith("ocr_"))
@@ -421,7 +529,7 @@ class APITests(unittest.TestCase):
     def test_versioned_api_matches_unversioned_paths(self):
         allowed = self.create_pipeline("Счета")
         hidden = self.create_pipeline("Договоры")
-        token = self.client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [allowed]}).json()["token"]
+        token = self.issue_key(**{"name": "ERP", "pipeline_ids": [allowed]}).json()["token"]
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + token})
         self.assertEqual([pipeline["id"] for pipeline in integration.get("/api/v1/pipelines").json()["pipelines"]], [allowed])
         by_path = self.send_document(integration, f"/api/v1/pipelines/{allowed}/run")
@@ -433,14 +541,15 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.send_document(integration, "/api/v1/pipeline/run", {"pipeline_id": hidden}).status_code, 403)
         self.assertEqual(self.send_document(integration, "/api/v1/pipeline/run", {"pipeline": json.dumps({"source": "document"})}).status_code, 403)
         self.assertEqual(TestClient(self.app).get("/api/v1/pipelines").status_code, 401)
-        # Администратор получает тот же список, а служебные разделы под /api/v1 не публикуются.
-        self.assertEqual(self.client.get("/api/v1/pipelines").json(), self.client.get("/api/pipelines").json())
+        # Versioned API exposes only public contracts even to an administrator.
+        self.assertEqual({p["id"] for p in self.client.get("/api/v1/pipelines").json()["pipelines"]}, {allowed, hidden})
+        self.assertNotIn("source", self.client.get("/api/v1/pipelines").json()["pipelines"][0])
         self.assertEqual(self.client.get("/api/v1/keys").status_code, 404)
 
     def test_integration_key_sees_only_documents_it_processed(self):
         pipeline = self.create_pipeline("Счета")
-        first = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [pipeline]}).json()
-        second = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [pipeline]}).json()
+        first = self.issue_key(**{"name": "1С", "pipeline_ids": [pipeline]}).json()
+        second = self.issue_key(**{"name": "CRM", "pipeline_ids": [pipeline]}).json()
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + first["token"]})
         other = TestClient(self.app, headers={"Authorization": "Bearer " + second["token"]})
 
@@ -482,11 +591,11 @@ class APITests(unittest.TestCase):
         self.assertEqual({item["id"] for item in self.client.get("/api/v1/documents").json()["documents"]}, {*own, foreign, manual})
         self.assertIsNone(self.client.get(f"/api/documents/{manual}").json()["document"]["pipeline_id"])
 
-        # Отозванный ключ теряет доступ, а новый ключ той же интеграции старые документы не видит.
+        # Отозванный ключ теряет доступ, а сменный ключ того же клиента сохраняет историю.
         self.client.delete(f"/api/keys/{first['key']['id']}")
         self.assertEqual(integration.get("/api/v1/documents").status_code, 401)
-        replacement = self.client.post("/api/keys", json={"name": "1С", "pipeline_ids": [pipeline]}).json()["token"]
-        self.assertEqual(TestClient(self.app, headers={"Authorization": "Bearer " + replacement}).get("/api/v1/documents").json()["documents"], [])
+        replacement = self.client.post("/api/keys", json={"name": "1С — новый", "client_id": first["key"]["client_id"], "permissions": ["run", "results", "history"]}).json()["token"]
+        self.assertEqual({row["id"] for row in TestClient(self.app, headers={"Authorization": "Bearer " + replacement}).get("/api/v1/documents").json()["documents"]}, set(own))
 
     def test_existing_documents_table_is_upgraded(self):
         storage = self.storage / "legacy"
@@ -509,7 +618,7 @@ class APITests(unittest.TestCase):
             old = client.get("/api/documents/old-doc").json()["document"]
             self.assertEqual((old["filename"], old["fields"], old["pipeline_id"]), ("old.txt", {}, None))
             pipeline = client.post("/api/pipelines", json={"id": "new_pipeline", "name": "Новый", "source": "document", "extraction": None}).json()["pipeline"]["id"]
-            token = client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [pipeline]}).json()["token"]
+            token = self.issue_key(client=client, **{"name": "ERP", "pipeline_ids": [pipeline]}).json()["token"]
             integration = TestClient(app, headers={"Authorization": "Bearer " + token})
             # Старые документы остаются только у администратора.
             self.assertEqual(integration.get("/api/v1/documents").json()["documents"], [])
@@ -518,25 +627,57 @@ class APITests(unittest.TestCase):
         with TestClient(create_app(database, storage, httpx.MockTransport(self.upstream))) as again:
             self.assertEqual(self.sign_in(again).get("/api/documents").json()["documents"][0]["id"], "old-doc")
 
+    def test_existing_keys_documents_and_jobs_receive_client_owner(self):
+        from alembic import command
+        from alembic.config import Config
+        from backend.models import IntegrationClient
+
+        migration_storage = self.storage / "owned-migration"
+        migration_storage.mkdir()
+        database = self.database_for(migration_storage)
+        engine = create_engine(database)
+        config = Config()
+        config.set_main_option("script_location", str(Path(__file__).parents[1] / "migrations"))
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0007_result_schema")
+            connection.execute(sql("INSERT INTO pipelines (id, config, created_at, updated_at, deleted) VALUES ('invoice', '{\"name\":\"Invoice\",\"source\":\"document\"}', '2025', '2025', 0)"))
+            connection.execute(sql("INSERT INTO api_keys (id, name, token_hash, prefix, pipeline_ids, created_at, revoked_at) VALUES ('old-key', 'Legacy', 'hash', 'ocr_old', '[\"invoice\"]', '2025', NULL)"))
+            connection.execute(sql("INSERT INTO documents (id, filename, mime_type, size, pipeline_name, original_key, text, result, fields, created_at, updated_at, revision, pipeline_id, api_key_id, result_schema) VALUES ('old-doc', 'old.txt', 'text/plain', 3, 'Invoice', 'old', 'abc', 'abc', '{}', '2025', '2025', 0, 'invoice', 'old-key', '{\"type\":\"string\"}')"))
+            connection.execute(sql("INSERT INTO processing_jobs (id, status, filename, mime_type, size, original_key, pipeline, pipeline_id, api_key_id, error, created_at, updated_at, generation, attempts, next_run_at) VALUES ('old-job', 'queued', 'old.txt', 'text/plain', 3, 'old-job', '{\"name\":\"Invoice\",\"source\":\"document\"}', 'invoice', 'old-key', NULL, '2025', '2025', 0, 0, 0)"))
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+        migrated_engine, sessions = open_database(database)
+        with sessions() as session:
+            key = session.get(APIKey, "old-key")
+            self.assertEqual((key.client_id, key.permissions), ("old-key", ["run", "results", "history"]))
+            self.assertEqual((session.get(IntegrationClient, "old-key").name, session.get(IntegrationClient, "old-key").pipeline_ids), ("Legacy", ["invoice"]))
+            self.assertEqual(session.get(Document, "old-doc").client_id, "old-key")
+            self.assertEqual(session.get(ProcessingJob, "old-job").client_id, "old-key")
+        migrated_engine.dispose()
+        engine.dispose()
+
     def test_key_access_can_be_changed_and_revoked(self):
         first = self.create_pipeline("Первый")
         second = self.create_pipeline("Второй")
-        created = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [first]}).json()
+        created = self.issue_key(**{"name": "CRM", "pipeline_ids": [first]}).json()
         key_id = created["key"]["id"]
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + created["token"]})
 
-        updated = self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM 2", "pipeline_ids": [second, second]})
+        client_id = created["key"]["client_id"]
+        updated = self.client.patch(f"/api/clients/{client_id}", json={"name": "CRM 2", "pipeline_ids": [second, second]})
         self.assertEqual(updated.status_code, 200, updated.text)
-        self.assertEqual((updated.json()["key"]["name"], updated.json()["key"]["pipeline_ids"]), ("CRM 2", [second]))
+        self.assertEqual((updated.json()["client"]["name"], updated.json()["client"]["pipeline_ids"]), ("CRM 2", [second]))
         self.assertEqual(self.send_document(integration, f"/api/pipelines/{first}/run").status_code, 403)
         self.assertEqual(self.send_document(integration, f"/api/pipelines/{second}/run").status_code, 200)
 
         self.client.delete(f"/api/pipelines/{first}")
-        for ids in ([first], ["pl_missing"], []):
+        for ids in ([first], ["pl_missing"]):
             with self.subTest(ids=ids):
-                self.assertEqual(self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM", "pipeline_ids": ids}).status_code, 422)
-                self.assertEqual(self.client.post("/api/keys", json={"name": "Новый", "pipeline_ids": ids}).status_code, 422)
-        self.assertEqual(self.client.post("/api/keys", json={"name": "   ", "pipeline_ids": [second]}).status_code, 422)
+                self.assertEqual(self.client.patch(f"/api/clients/{client_id}", json={"name": "CRM", "pipeline_ids": ids}).status_code, 422)
+                self.assertEqual(self.issue_key(**{"name": "Новый", "pipeline_ids": ids}).status_code, 422)
+        self.assertEqual(self.issue_key(**{"name": "   ", "pipeline_ids": [second]}).status_code, 422)
 
         # Удалённый пайплайн пропадает у ключа, не ломая его.
         self.client.delete(f"/api/pipelines/{second}")
@@ -546,7 +687,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/keys/{key_id}").status_code, 200)
         self.assertEqual(integration.get("/api/pipelines").status_code, 401)
         self.assertEqual(self.client.delete(f"/api/keys/{key_id}").status_code, 200)
-        self.assertEqual(self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM", "pipeline_ids": [second]}).status_code, 404)
+        self.assertEqual(self.client.patch(f"/api/keys/{key_id}", json={"name": "CRM", "client_id": client_id, "permissions": ["run"]}).status_code, 404)
         self.assertEqual(self.client.delete("/api/keys/missing").status_code, 404)
         self.assertIsNotNone(self.client.get("/api/keys").json()["keys"][0]["revoked_at"])
 
@@ -698,8 +839,8 @@ class APITests(unittest.TestCase):
 
     def test_background_jobs_are_private_to_their_api_key(self):
         pipeline = self.create_pipeline("Счета")
-        first = self.client.post("/api/keys", json={"name": "ERP", "pipeline_ids": [pipeline]}).json()
-        second = self.client.post("/api/keys", json={"name": "CRM", "pipeline_ids": [pipeline]}).json()
+        first = self.issue_key(**{"name": "ERP", "pipeline_ids": [pipeline]}).json()
+        second = self.issue_key(**{"name": "CRM", "pipeline_ids": [pipeline]}).json()
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + first["token"]})
         other = TestClient(self.app, headers={"Authorization": "Bearer " + second["token"]})
         response = self.send_document(integration, f"/api/v1/pipelines/{pipeline}/run?background=true")
@@ -710,14 +851,52 @@ class APITests(unittest.TestCase):
         self.assertEqual(other.post(job["statusUrl"] + "/retry").status_code, 404)
         self.assertEqual(TestClient(self.app).get(job["statusUrl"]).status_code, 401)
         replacement = self.create_pipeline("Другой")
-        self.client.patch(f"/api/keys/{first['key']['id']}", json={"name": "ERP", "pipeline_ids": [replacement]})
-        self.assertEqual(integration.post(job["statusUrl"] + "/retry").status_code, 403)
+        self.client.patch(f"/api/clients/{first['key']['client_id']}", json={"name": "ERP", "pipeline_ids": [replacement]})
+        self.assertEqual(integration.post(job["statusUrl"] + "/retry").status_code, 404)
         self.execute_background(job["taskId"])
-        self.assertEqual(integration.get(job["statusUrl"]).json()["status"], "succeeded")
+        self.assertEqual(integration.get(job["statusUrl"]).status_code, 404)
         own = integration.get("/api/v1/documents").json()["documents"]
-        self.assertEqual([row["id"] for row in own], [job["taskId"]])
+        self.assertEqual(own, [])
         self.client.delete(f"/api/keys/{first['key']['id']}")
         self.assertEqual(integration.get(job["statusUrl"]).status_code, 401)
+
+    def test_client_has_ten_active_background_job_slots_shared_by_all_keys(self):
+        self.app.state.processing.settings = JobSettings(client_active_limit=10)
+        pipeline = self.create_pipeline("Limited")
+        issued = self.issue_key("Limited client", [pipeline]).json()
+        client_id = issued["key"]["client_id"]
+        second = self.client.post("/api/keys", json={
+            "name": "Second key", "client_id": client_id,
+            "permissions": ["run", "results", "history"],
+        }).json()
+        first_key = TestClient(self.app, headers={"Authorization": "Bearer " + issued["token"]})
+        second_key = TestClient(self.app, headers={"Authorization": "Bearer " + second["token"]})
+
+        failed = self.send_document(first_key, f"/api/v1/pipelines/{pipeline}/run?background=true").json()
+        with self.app.state.sessions.begin() as session:
+            session.get(ProcessingJob, failed["taskId"]).status = "failed"
+        active = []
+        for index in range(10):
+            response = self.send_document(first_key if index < 5 else second_key, f"/api/v1/pipelines/{pipeline}/run?background=true")
+            self.assertEqual(response.status_code, 202, response.text)
+            active.append(response.json()["taskId"])
+
+        stored_objects = len(self.s3_client.objects)
+        blocked = self.send_document(second_key, f"/api/v1/pipelines/{pipeline}/run?background=true")
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertEqual(blocked.headers["Retry-After"], "5")
+        self.assertIn("10 активных задач", blocked.json()["error"])
+        self.assertEqual(len(self.s3_client.objects), stored_objects)
+        self.assertEqual(second_key.post(f"/api/v1/jobs/{failed['taskId']}/retry").status_code, 429)
+
+        # Another client has an independent pool of ten slots.
+        other = self.issue_key("Other client", [pipeline]).json()["token"]
+        other_response = self.send_document(TestClient(self.app, headers={"Authorization": "Bearer " + other}), f"/api/v1/pipelines/{pipeline}/run?background=true")
+        self.assertEqual(other_response.status_code, 202, other_response.text)
+
+        self.execute_background(active[0])
+        retry = second_key.post(f"/api/v1/jobs/{failed['taskId']}/retry")
+        self.assertEqual(retry.status_code, 202, retry.text)
 
     def test_publish_failure_preserves_task_id_and_original_for_recovery(self):
         job = self.submit_background(b"recover")
@@ -924,10 +1103,10 @@ class APITests(unittest.TestCase):
         from alembic.config import Config
         from sqlalchemy.dialects.postgresql import JSONB, JSON
         from backend.migrate import migrate
-        columns = [("documents", "fields"), ("processing_jobs", "pipeline"), ("pipelines", "config"), ("api_keys", "pipeline_ids"), ("login_guard", "failures")]
+        columns = [("documents", "fields"), ("processing_jobs", "pipeline"), ("pipelines", "config"), ("integration_clients", "pipeline_ids"), ("login_guard", "failures")]
         payload = {"id":"jsonb_test", "name":"JSONB тест", "source":"document"}
         self.assertEqual(self.client.post("/api/pipelines", json=payload).status_code, 201)
-        self.assertEqual(self.client.post("/api/keys", json={"name":"JSONB key", "pipeline_ids":["jsonb_test"]}).status_code, 201)
+        self.assertEqual(self.issue_key(**{"name":"JSONB key", "pipeline_ids":["jsonb_test"]}).status_code, 201)
         self.assertEqual(self.upload(b'{"nested":{"amount":1500,"items":[true,null,"text"]}}').status_code, 200)
         self.submit_background(pipeline={"name":"JSONB задача", "source":"document"})
         self.client.post("/api/auth/login", json={"login":"wrong", "password":"wrong"})
@@ -1004,7 +1183,7 @@ class APITests(unittest.TestCase):
     def test_history_pipeline_filter_keeps_integration_ownership(self):
         self.client.post("/api/pipelines", json={"id":"owned", "name":"Owned", "source":"document"})
         self.client.post("/api/pipelines/owned/run", files={"file":("admin.txt", b"Admin document", "text/plain")})
-        token = self.client.post("/api/keys", json={"name":"Integration", "pipeline_ids":["owned"]}).json()["token"]
+        token = self.issue_key(**{"name":"Integration", "pipeline_ids":["owned"]}).json()["token"]
         self.client.cookies.clear()
         headers = {"Authorization":f"Bearer {token}"}
         uploaded = self.client.post("/api/v1/pipelines/owned/run", headers=headers, files={"file":("owned.txt", b"Own document", "text/plain")})
@@ -1049,7 +1228,7 @@ class APITests(unittest.TestCase):
             self.assertFalse(stored["extraction"]["prompt_enabled"])
             self.assertFalse(stored["extraction"]["fields_enabled"])
             self.assertEqual(stored["extraction"]["prompt"], "Use the final total")
-            self.assertEqual(stored["extraction"]["fields"], [{"name":"total", "description":""}])
+            self.assertEqual(stored["extraction"]["fields"], [{"name":"total", "description":"", "public_description":"", "type":"string", "fields":[]}])
         before = len(self.calls)
         job = self.submit_background(pipeline=stored)
         self.execute_background(job["taskId"])
@@ -1098,6 +1277,123 @@ class APITests(unittest.TestCase):
                 if process.poll() is None:
                     process.kill()
                     process.communicate()
+
+
+    def test_public_nested_contract_sync_background_and_history(self):
+        config = {"id": "typed", "name": "Typed", "description": "Public pipeline", "source": "document", "extraction": {
+            "model": "extract", "prompt": "SECRET PROMPT", "fields": [{"name": "objects", "type": "array",
+            "description": "SECRET RULE", "public_description": "Objects", "fields": [{"name": "count", "type": "integer", "public_description": "Count"}]}]}}
+        created = self.client.post("/api/pipelines", json=config)
+        self.assertEqual(created.status_code, 201, created.text)
+        token = self.issue_key(**{"name": "Typed", "pipeline_ids": ["typed"]}).json()["token"]
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + token})
+        contract = integration.get("/api/v1/pipelines").json()["pipelines"][0]
+        self.assertEqual(set(contract), {"id", "name", "description", "executionModes", "asyncConcurrency", "resultSchema"})
+        self.assertNotIn("SECRET", json.dumps(contract))
+        self.assertEqual(contract["resultSchema"]["properties"]["objects"]["items"]["properties"]["count"]["type"], ["integer", "null"])
+        self.assertEqual(integration.get("/api/pipelines").json()["pipelines"], [contract])
+        self.assertIn("extraction", self.client.get("/api/pipelines").json()["pipelines"][0])
+        expected = {"objects": [{"count": 3}]}
+        from unittest.mock import AsyncMock
+        with patch("backend.processing.complete", new=AsyncMock(return_value=json.dumps(expected))):
+            response = self.send_document(integration, "/api/v1/pipelines/typed/run")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["result"], expected)
+            doc_id = response.json()["documentId"]
+            queued = self.send_document(integration, "/api/v1/pipelines/typed/run?background=true").json()
+            self.app.state.processing.execute(queued["taskId"])
+        self.assertEqual(integration.get(f"/api/v1/jobs/{queued['taskId']}").json()["result"], expected)
+        self.assertEqual(integration.get(f"/api/v1/documents/{doc_id}").json()["document"]["result"], expected)
+        # Result contract survives config changes and edits to the separate operator fields.
+        self.client.patch("/api/pipelines/typed", json={**config, "extraction": None})
+        self.client.patch(f"/api/documents/{doc_id}", json={"fields": {}, "revision": 0})
+        self.assertEqual(integration.get(f"/api/v1/documents/{doc_id}").json()["document"]["result"], expected)
+        self.assertEqual(integration.get("/api/v1/pipelines").json()["pipelines"][0]["resultSchema"], {"type": "string"})
+        raw = integration.post("/api/v1/pipelines/typed/run", files={"file": ("x.txt", b'{"hello":123}', "text/plain")})
+        self.assertEqual(raw.json()["result"], '{"hello":123}')
+        self.assertEqual(integration.get(f"/api/v1/documents/{raw.json()['documentId']}").json()["document"]["result"], '{"hello":123}')
+
+
+    def test_client_ownership_rotation_and_current_pipeline_access(self):
+        pipeline = self.create_pipeline("Client pipeline")
+        issued = self.issue_key("Owner", [pipeline]).json()
+        client_id = issued["key"]["client_id"]
+        def credential(token):
+            return TestClient(self.app, headers={"Authorization": "Bearer " + token})
+        original = credential(issued["token"])
+        rotated = self.client.post("/api/keys", json={"name": "Replacement", "client_id": client_id, "permissions": ["run", "results", "history"]}).json()
+        replacement = credential(rotated["token"])
+        foreign = credential(self.issue_key("Other", [pipeline]).json()["token"])
+        doc_id = self.send_document(original, f"/api/v1/pipelines/{pipeline}/run").json()["documentId"]
+        job = self.send_document(original, f"/api/pipelines/{pipeline}/run?background=true").json()
+        self.client.delete(f"/api/keys/{issued['key']['id']}")
+        self.assertEqual(original.get(f"/api/v1/documents/{doc_id}").status_code, 401)
+        self.assertEqual(replacement.get(f"/api/v1/documents/{doc_id}").status_code, 200)
+        self.assertEqual(foreign.get(f"/api/v1/documents/{doc_id}").status_code, 404)
+        self.assertEqual(foreign.get(job["statusUrl"]).status_code, 404)
+        self.assertEqual(foreign.post(job["statusUrl"] + "/retry").status_code, 404)
+        self.assertEqual(replacement.post(job["statusUrl"] + "/retry").status_code, 202)
+        self.execute_background(job["taskId"])
+        self.assertEqual(replacement.get(job["statusUrl"]).json()["status"], "succeeded")
+        with self.app.state.sessions() as session:
+            self.assertEqual(session.get(Document, job["taskId"]).client_id, client_id)
+            self.assertEqual(session.get(Document, doc_id).client_id, client_id)
+            self.assertEqual(session.get(ProcessingJob, job["taskId"]).client_id, client_id)
+        self.assertEqual(len(replacement.get("/api/v1/documents").json()["documents"]), 2)
+        self.client.patch(f"/api/clients/{client_id}", json={"name": "Owner", "pipeline_ids": []})
+        self.assertEqual(replacement.get("/api/v1/documents").json()["documents"], [])
+        self.assertEqual(replacement.get(f"/api/v1/documents/{doc_id}").status_code, 404)
+        for prefix in ("/api", "/api/v1"):
+            self.assertEqual(replacement.get(f"{prefix}/jobs/{job['taskId']}").status_code, 404)
+            self.assertEqual(replacement.post(f"{prefix}/jobs/{job['taskId']}/retry").status_code, 404)
+            self.assertEqual(self.send_document(replacement, f"{prefix}/pipelines/{pipeline}/run").status_code, 403)
+        self.assertEqual(self.client.get(f"/api/documents/{doc_id}").status_code, 200)
+        self.client.patch(f"/api/clients/{client_id}", json={"name": "Owner", "pipeline_ids": [pipeline]})
+        self.assertEqual(replacement.get(f"/api/v1/documents/{doc_id}").status_code, 200)
+        self.client.delete(f"/api/pipelines/{pipeline}")
+        self.assertEqual(replacement.get(f"/api/v1/documents/{doc_id}").status_code, 404)
+        self.assertEqual(replacement.get(job["statusUrl"]).status_code, 404)
+
+    def test_key_action_permissions_cover_all_response_paths(self):
+        pipeline = self.create_pipeline("Permission pipeline")
+        issued = self.issue_key("Permissions", [pipeline]).json()
+        identity = {"name": "Permissions", "client_id": issued["key"]["client_id"]}
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + issued["token"]})
+        job = self.send_document(integration, f"/api/v1/pipelines/{pipeline}/run?background=true").json()
+        self.execute_background(job["taskId"])
+        doc_url = f"/api/v1/documents/{job['taskId']}"
+        for permission in ("run", "results", "history"):
+            with self.subTest(permission=permission):
+                changed = self.client.patch(f"/api/keys/{issued['key']['id']}", json={**identity, "permissions": [permission]})
+                self.assertEqual(changed.status_code, 200, changed.text)
+                self.assertEqual(integration.get(doc_url).status_code, 200 if permission == "results" else 403)
+                self.assertEqual(integration.get("/api/v1/documents").status_code, 200 if permission == "history" else 403)
+                for prefix in ("/api", "/api/v1"):
+                    self.assertEqual(integration.get(f"{prefix}/jobs/{job['taskId']}").status_code, 200 if permission == "results" else 403)
+                    for url, data in ((f"{prefix}/pipelines/{pipeline}/run", None), (f"{prefix}/pipeline/run", {"pipeline_id": pipeline})):
+                        response = self.send_document(integration, url, data)
+                        self.assertEqual(response.status_code, 200 if permission == "run" else 403)
+                        if permission == "run":
+                            self.assertEqual(set(response.json()), {"file", "documentId", "status"})
+                    self.assertEqual(integration.post(f"{prefix}/jobs/{job['taskId']}/retry").status_code, 409 if permission == "run" else 403)
+        self.client.patch(f"/api/keys/{issued['key']['id']}", json={**identity, "permissions": []})
+        self.assertEqual(integration.get(doc_url).status_code, 403)
+        self.assertEqual(integration.get("/api/v1/documents").status_code, 403)
+
+    def test_key_client_is_required_immutable_and_admin_managed(self):
+        pipeline = self.create_pipeline("Access")
+        issued = self.issue_key("First", [pipeline]).json()
+        other = self.issue_key("Second", [pipeline]).json()
+        identity = {"name": "Key", "client_id": issued["key"]["client_id"], "permissions": ["run"]}
+        for payload in ({"name": "No client", "permissions": ["run"]}, {**identity, "client_id": "missing"}, {**identity, "permissions": ["admin"]}, {**identity, "pipeline_ids": [pipeline]}):
+            self.assertEqual(self.client.post("/api/keys", json=payload).status_code, 422)
+        self.assertEqual(self.client.patch(f"/api/keys/{issued['key']['id']}", json={**identity, "client_id": other["key"]["client_id"]}).status_code, 409)
+        integration = TestClient(self.app, headers={"Authorization": "Bearer " + issued["token"]})
+        for api_client, expected in ((TestClient(self.app), 401), (integration, 403)):
+            self.assertEqual(api_client.get("/api/clients").status_code, expected)
+            self.assertEqual(api_client.post("/api/clients", json={"name": "New", "pipeline_ids": []}).status_code, expected)
+            self.assertEqual(api_client.patch(f"/api/clients/{identity['client_id']}", json={"name": "Changed", "pipeline_ids": []}).status_code, expected)
+        self.assertEqual(len(self.client.get("/api/clients").json()["clients"]), 2)
 
 
 class DatabaseConfigurationTests(unittest.TestCase):
@@ -1159,6 +1455,8 @@ class ProxyTests(unittest.TestCase):
             excluded = client._transport_for_url(httpx.URL("http://127.0.0.1:8000/recognize"))
         self.assertEqual((routed._pool._proxy_url.host, routed._pool._proxy_url.port), (b"proxy.company.local", 8080))
         self.assertFalse(hasattr(excluded._pool, "_proxy_url"))
+
+
 
 
 if __name__ == "__main__":
