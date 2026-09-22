@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="gradMain" x1="0%" y1="15%" x2="100%" y2="85%">
+      <stop offset="0%" stop-color="#00A83B"/>
+      <stop offset="45%" stop-color="#55D52A"/>
+      <stop offset="68%" stop-color="#FFC21C"/>
+      <stop offset="100%" stop-color="#FF7A00"/>
+    </linearGradient>
+
+    <linearGradient id="gradFold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#24D62D"/>
+      <stop offset="55%" stop-color="#BCEB16"/>
+      <stop offset="100%" stop-color="#FF9A00"/>
+    </linearGradient>
+
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feColorMatrix in="blur" type="matrix"
+        values="1 0 0 0 0
+                0 1 0 0 0
+                0 0 1 0 0
+                0 0 0 .28 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#ffffff"/>
+
+  <!-- outer glow -->
+  <path d="M230 115
+           H655
+           L822 282
+           V470
+           H875
+           Q900 470 900 495
+           V560
+           Q900 585 875 585
+           H822
+           V800
+           Q822 870 752 870
+           H230
+           Q160 870 160 800
+           V185
+           Q160 115 230 115Z"
+        fill="none" stroke="url(#gradMain)" stroke-width="48"
+        opacity=".20" filter="url(#softGlow)"/>
+
+  <!-- document outline -->
+  <path d="M230 115
+           H655
+           L822 282
+           V470
+           H875
+           Q900 470 900 495
+           V560
+           Q900 585 875 585
+           H822
+           V800
+           Q822 870 752 870
+           H230
+           Q160 870 160 800
+           V185
+           Q160 115 230 115Z"
+        fill="none"
+        stroke="url(#gradMain)"
+        stroke-width="44"
+        stroke-linejoin="round"
+        stroke-linecap="round"
+        filter="url(#glow)"/>
+
+  <!-- folded corner fill -->
+  <path d="M655 115
+           L822 282
+           H720
+           Q655 282 655 217Z"
+        fill="url(#gradFold)"
+        filter="url(#glow)"/>
+
+  <!-- text bars -->
+  <rect x="285" y="255" width="285" height="46" rx="23"
+        fill="url(#gradMain)" filter="url(#glow)"/>
+  <rect x="285" y="340" width="330" height="46" rx="23"
+        fill="url(#gradMain)" filter="url(#glow)"/>
+
+  <!-- scanner corners -->
+  <g fill="none" stroke="url(#gradMain)" stroke-width="38"
+     stroke-linecap="round" filter="url(#glow)">
+    <path d="M305 555 V500 Q305 475 330 475 H385"/>
+    <path d="M650 475 H705 Q730 475 730 500 V555"/>
+    <path d="M305 690 V745 Q305 770 330 770 H385"/>
+    <path d="M650 770 H705 Q730 770 730 745 V690"/>
+  </g>
+</svg>
