@@ -34,7 +34,7 @@ function Navigation() {
   const displayName = user?.name || user?.login || "Пользователь";
   const initials = displayName.trim().split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toUpperCase();
   return <Sidebar className="app-navigation">
-    <SidebarHeader className="navigation-brand"><img src="/ocr_pipeline_creator_logo.svg" alt="OCR Pipeline Creator" width={48} height={48}/><span>OCR Pipeline Creator</span></SidebarHeader>
+    <SidebarHeader className="navigation-brand"><img src="/assets/enplus-logo.svg" alt="Эн+" width={77} height={34}/><span>OCR Pipeline Creator</span></SidebarHeader>
     <SidebarContent className="navigation-content">
       <p className="navigation-caption">РАБОЧЕЕ ПРОСТРАНСТВО</p>
       <nav aria-label="Основная навигация"><SidebarMenu>{links.filter((item) => user?.role === "admin" || !["/createpipeline", "/api-keys"].includes(item.href)).map(({ href, label, icon: Icon, match }) => {

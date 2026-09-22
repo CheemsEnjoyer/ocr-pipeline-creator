@@ -9,16 +9,22 @@ from ...schema.pipeline import Pipeline
 from ...core.config import MAX_FILE_SIZE
 
 
+def load_pipeline(app, pipeline_id, request):
+    """Пайплайн, если он существует и разрешён пришедшему ключу. Блокирующий вызов."""
+    if not request.state.user_id and pipeline_id not in request.state.pipeline_ids:
+        raise HTTPException(403, "Ключу не разрешён этот пайплайн")
+    with app.state.sessions() as session:
+        row = session.get(SavedPipeline, pipeline_id)
+        if row is None or row.deleted:
+            raise HTTPException(404, "Пайплайн не найден")
+        return Pipeline.model_validate(row.config)
+
+
 def create_router(app, storage):
     router = APIRouter(tags=["Processing"])
+
     def stored_pipeline(pipeline_id, request):
-        if not request.state.user_id and pipeline_id not in request.state.pipeline_ids:
-            raise HTTPException(403, "Ключу не разрешён этот пайплайн")
-        with app.state.sessions() as session:
-            row = session.get(SavedPipeline, pipeline_id)
-            if row is None or row.deleted:
-                raise HTTPException(404, "Пайплайн не найден")
-            return Pipeline.model_validate(row.config)
+        return load_pipeline(app, pipeline_id, request)
 
     @router.post("/pipelines/{pipeline_id}/run", dependencies=[Depends(integration_allowed)])
     async def run_saved_pipeline(pipeline_id: str, request: Request, file: UploadFile = File(), background: bool | None = Query(default=None)):

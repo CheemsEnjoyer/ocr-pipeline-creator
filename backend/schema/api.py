@@ -7,15 +7,17 @@ from pydantic import BaseModel, Field
 from .pipeline import Pipeline, result_schema
 
 
-class InitTaskRequestDTO(BaseModel):
+class CreateTaskRequest(BaseModel):
+    """Тело POST /api/v1/pipelines/{pipeline_id}/tasks.
+
+    Ровно те поля, что шлёт внешняя учётная система: чем обрабатывать — сказано
+    адресом, а не телом запроса.
+    """
+
     task_code: str = Field(min_length=1, max_length=80, pattern=r"\S")
-    document_type: str = Field(default="generic", min_length=1, max_length=80, pattern=r"\S")
-    # MIME-тип файла по document_link: в ссылке расширения может не быть. Формат не
-    # проверяем — контракт внешней системы допускает любую строку, а тип документа
-    # для выбора обработки приходит отдельно в document_type.
-    content_type: str = Field(min_length=1, max_length=255, pattern=r"\S")
-    callback_url: str = Field(min_length=1, pattern=r"\S")
     document_link: str = Field(min_length=1, pattern=r"\S")
+    callback_url: str = Field(min_length=1, pattern=r"\S")
+    content_type: str = Field(min_length=1, max_length=255, pattern=r"\S")
 
 
 def serialize(document, detail=False):
@@ -48,7 +50,6 @@ def serialize_public_pipeline(row):
     return {
         "id": row.id,
         "name": pipeline.name,
-        "description": pipeline.description,
         "executionModes": [mode for mode, allowed in (("sync", pipeline.allow_sync), ("async", pipeline.allow_async)) if allowed],
         **({"asyncConcurrency": pipeline.async_concurrency} if pipeline.allow_async else {}),
         "resultSchema": result_schema(pipeline),

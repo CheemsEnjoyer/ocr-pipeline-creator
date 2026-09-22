@@ -6,6 +6,7 @@ from ..core.config import JobSettings
 from ..db.infra.engine import configured_database_url, open_database
 from ..db.infra.repositories import OutboxRepository
 from ..core.security import configure_logging
+from ..service.callbacks import deliver_once
 from .tasks import enqueue_job
 
 logger = logging.getLogger("ocr.dispatcher")
@@ -44,6 +45,12 @@ def main():
                 dispatch_once(sessions, settings)
             except Exception as error:
                 logger.error("Сбой диспетчера: %s", type(error).__name__)
+            try:
+                # Доставка результатов push-задач идёт тем же циклом: отдельный
+                # процесс ради одного HTTP-запроса в секунду не нужен.
+                deliver_once(sessions)
+            except Exception as error:
+                logger.error("Сбой доставки callback: %s", type(error).__name__)
             stopping.wait(1)
     finally:
         engine.dispose()

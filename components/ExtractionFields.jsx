@@ -18,7 +18,6 @@ export default function ExtractionFields({ fields, onChange, depth = 1, path = "
             {FIELD_TYPES.map(([value, title]) => <option key={value} value={value} disabled={depth >= 6 && ["object", "array"].includes(value)}>{title}</option>)}
           </select><Button variant="ghost" size="icon" aria-label={`Удалить поле ${label}`} onClick={() => onChange(fields.filter((_, i) => i !== index))}><Trash2 size={16}/></Button>
         </div>
-        <label className="typed-field-label">Публичное описание<Textarea aria-label={`Публичное описание поля ${label}`} rows={2} value={field.public_description || ""} onChange={(event) => update(index, { public_description: event.target.value })} placeholder="Что означает поле — видно клиенту в API"/></label>
         <details className="field-instructions" open={field.description ? true : undefined}><summary>Инструкции извлечения — только для модели</summary><Textarea aria-label={`Инструкции поля ${label}`} rows={2} value={field.description || ""} onChange={(event) => update(index, { description: event.target.value })} placeholder="Правила поиска и обработки значения"/></details>
         {isNested(field) && <div className="nested-fields"><p>{field.type === "array" ? "Каждый элемент списка — объект с указанными ниже полями." : "Состав объекта."}</p><ExtractionFields fields={field.fields || []} onChange={(children) => update(index, { fields: children })} depth={depth + 1} path={`${label}.`}/></div>}
       </div>;

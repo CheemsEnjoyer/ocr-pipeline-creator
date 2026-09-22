@@ -108,7 +108,7 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(fields=fields), self.assertRaises(ValidationError):
                 Extraction(mode="fields", model="extract", fields=fields)
 
-    async def test_nested_typed_result_and_public_descriptions(self):
+    async def test_nested_typed_result_without_public_descriptions(self):
         self.extraction = Extraction(model="extract", fields=[{
             "name": "objects", "type": "array", "description": "PRIVATE RULE", "public_description": "Информация об объектах",
             "fields": [
@@ -123,7 +123,9 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.request('{"objects": null}'), '{"objects": null}')
         public = fields_schema(self.extraction.fields, public=True)
         self.assertNotIn("PRIVATE RULE", json.dumps(public))
-        self.assertEqual(public["properties"]["objects"]["description"], "Информация об объектах")
+        self.assertNotIn("description", public["properties"]["objects"])
+        self.assertNotIn("public_description", self.extraction.model_dump()["fields"][0])
+        self.assertEqual(fields_schema(self.extraction.fields)["properties"]["objects"]["description"], "PRIVATE RULE")
         for invalid in [
             {"objects": [None]}, {"objects": [{}]}, {"objects": {}},
             {"objects": [{"name": "x", "price": True, "count": 1, "active": False, "address": None}]},

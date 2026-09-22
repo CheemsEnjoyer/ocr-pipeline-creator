@@ -136,6 +136,16 @@ class JobRepository:
             claimed.stage = stage
             return True
 
+    def attach_original(self, claimed, original_key, size):
+        """Файл push-задачи появляется только после скачивания по ссылке."""
+        with self.sessions.begin() as session:
+            job = session.scalar(select(ProcessingJob).where(ProcessingJob.id == claimed.id).with_for_update())
+            if job is None or job.status != "processing" or job.lease_token != claimed.lease_token:
+                return False
+            job.original_key, job.size, job.updated_at = original_key, size, now()
+            claimed.original_key, claimed.size = original_key, size
+            return True
+
     def complete(self, claimed, document):
         with self.sessions.begin() as session:
             job = session.scalar(select(ProcessingJob).where(ProcessingJob.id == claimed.id).with_for_update())

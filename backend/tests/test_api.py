@@ -21,6 +21,7 @@ from backend.db.domain.models import AdminSession, APIKey, Document, LoginGuard,
 from backend.db.infra.engine import configured_database_url, open_database
 from backend.handler.storage import S3Storage, TemporaryFileResponse
 from backend.server import create_app
+from backend.service.callbacks import MAX_ATTEMPTS as MAX_CALLBACK_ATTEMPTS, deliver_once, send
 from backend.service.throttle import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
 from backend.worker.dispatcher import dispatch_once
 from backend.worker.tasks import execute_job
@@ -126,6 +127,112 @@ class APITests(unittest.TestCase):
     def upload(self, content=b'{"total": 1250}', filename="test.json", mime="application/json", pipeline=None):
         return self.client.post("/api/pipeline/run", files={"file": (filename, content, mime)}, data={"pipeline": json.dumps(pipeline or {"source": "document", "name": "Тест"})})
 
+    def crm_transport(self, document=b'{"total": 1500}'):
+        """Внешняя система: отдаёт документ по ссылке и принимает результат."""
+        def handler(request):
+            self.crm_calls.append(request)
+            if request.url.path.startswith("/files/"):
+                return httpx.Response(200, content=document, headers={"content-type": "application/json"})
+            if request.url.path == "/ocr/callback":
+                return httpx.Response(200, json={"accepted": True})
+            return self.upstream(request)
+        return httpx.MockTransport(handler)
+
+    def push_task(self, pipeline, client, **overrides):
+        body = {"task_code": "CRM-42", "document_link": "https://crm.test/files/42.json",
+                "callback_url": "https://crm.test/ocr/callback", "content_type": "application/json", **overrides}
+        return client.post(f"/api/v1/pipelines/{pipeline}/tasks", json=body)
+
+    def test_external_system_pushes_a_task_and_receives_the_result(self):
+        self.crm_calls = []
+        pipeline = self.create_pipeline("Заявки из CRM")
+        token = self.issue_key("crm", [pipeline]).json()["token"]
+        crm = TestClient(self.app, headers={"Authorization": "Bearer " + token})
+
+        created = self.push_task(pipeline, crm)
+        self.assertEqual(created.status_code, 202, created.text)
+        task_id = created.json()["taskId"]
+        self.assertEqual(created.json()["task_code"], "CRM-42")
+        self.assertEqual(created.json()["statusUrl"], f"/api/v1/jobs/{task_id}")
+
+        with self.app.state.sessions() as session:
+            job = session.get(ProcessingJob, task_id)
+            # Файла ещё нет: задача приходит ссылкой, качает её воркер.
+            self.assertIsNone(job.original_key)
+            self.assertEqual(job.source_url, "https://crm.test/files/42.json")
+            self.assertEqual((job.task_code, job.callback_status, job.status), ("CRM-42", "pending", "queued"))
+
+        execute_job(task_id, self.app.state.sessions, self.originals, self.crm_transport())
+        status = crm.get(f"/api/v1/jobs/{task_id}").json()
+        self.assertEqual(status["status"], "succeeded", status)
+        with self.app.state.sessions() as session:
+            job = session.get(ProcessingJob, task_id)
+            self.assertIsNotNone(job.original_key)
+            self.assertEqual(job.size, len(b'{"total": 1500}'))
+
+        transport = self.crm_transport()
+        delivered = deliver_once(self.app.state.sessions, sender=lambda claimed: send(claimed, transport=transport))
+        self.assertEqual(delivered, 1)
+        callback = [call for call in self.crm_calls if call.url.path == "/ocr/callback"]
+        self.assertEqual(len(callback), 1)
+        body = json.loads(callback[0].content)
+        self.assertEqual(body["task_code"], "CRM-42")
+        self.assertEqual(body["status"], "succeeded")
+        self.assertEqual(body["document_id"], task_id)
+        self.assertIn("1500", json.dumps(body["result"], ensure_ascii=False))
+        with self.app.state.sessions() as session:
+            self.assertEqual(session.get(ProcessingJob, task_id).callback_status, "sent")
+        # Доставленный результат второй раз не отправляется.
+        self.assertEqual(deliver_once(self.app.state.sessions, sender=lambda claimed: send(claimed, transport=transport)), 0)
+
+    def test_push_task_contract_is_closed(self):
+        self.crm_calls = []
+        pipeline = self.create_pipeline("Заявки из CRM")
+        token = self.issue_key("crm", [pipeline]).json()["token"]
+        crm = TestClient(self.app, headers={"Authorization": "Bearer " + token})
+        self.assertEqual(self.push_task(pipeline, crm).status_code, 202)
+
+        # Код задачи уникален внутри клиента.
+        self.assertEqual(self.push_task(pipeline, crm).status_code, 409)
+        # Тот же код у другого клиента — своя задача, а не конфликт.
+        other = TestClient(self.app, headers={"Authorization": "Bearer " + self.issue_key("erp", [pipeline]).json()["token"]})
+        self.assertEqual(self.push_task(pipeline, other).status_code, 202)
+        # Сервер не ходит во внутреннюю сеть по чужой указке.
+        for field in ("document_link", "callback_url"):
+            with self.subTest(field=field):
+                unsafe = self.push_task(pipeline, crm, task_code="CRM-43", **{field: "http://127.0.0.1:8000/secret"})
+                self.assertEqual(unsafe.status_code, 400, unsafe.text)
+        # Все четыре поля обязательны, чужой пайплайн закрыт, аноним не пускается.
+        self.assertEqual(crm.post(f"/api/v1/pipelines/{pipeline}/tasks", json={"task_code": "CRM-44"}).status_code, 422)
+        self.assertEqual(self.push_task("missing-pipeline", crm, task_code="CRM-45").status_code, 403)
+        self.assertEqual(self.push_task(pipeline, TestClient(self.app), task_code="CRM-46").status_code, 401)
+
+    def test_failed_callback_is_retried_then_given_up(self):
+        self.crm_calls = []
+        pipeline = self.create_pipeline("Заявки из CRM")
+        token = self.issue_key("crm", [pipeline]).json()["token"]
+        crm = TestClient(self.app, headers={"Authorization": "Bearer " + token})
+        task_id = self.push_task(pipeline, crm).json()["taskId"]
+        execute_job(task_id, self.app.state.sessions, self.originals, self.crm_transport())
+
+        def refuse(claimed):
+            raise httpx.ConnectError("Соединение отклонено")
+
+        for attempt in range(1, MAX_CALLBACK_ATTEMPTS + 1):
+            with self.subTest(attempt=attempt):
+                with self.app.state.sessions.begin() as session:
+                    # Ждать реальный backoff незачем: срок следующей попытки сдвигаем сами.
+                    session.get(ProcessingJob, task_id).callback_next_at = 0
+                self.assertEqual(deliver_once(self.app.state.sessions, sender=refuse), 0)
+                with self.app.state.sessions() as session:
+                    job = session.get(ProcessingJob, task_id)
+                    self.assertEqual(job.callback_attempts, attempt)
+                    expected = "failed" if attempt >= MAX_CALLBACK_ATTEMPTS else "pending"
+                    self.assertEqual(job.callback_status, expected)
+                    self.assertIn("ConnectError", job.callback_error)
+        # Результат не потерян: его по-прежнему можно забрать опросом.
+        self.assertEqual(crm.get(f"/api/v1/jobs/{task_id}").json()["status"], "succeeded")
+
     def test_schema_documents_only_the_integration_api(self):
         """В /api/docs отдаётся контракт выгрузки во внешние учётные системы — и только он.
 
@@ -142,6 +249,7 @@ class APITests(unittest.TestCase):
             ("POST", "/api/v1/jobs/{job_id}/retry"),
             ("GET", "/api/v1/documents"),
             ("GET", "/api/v1/documents/{document_id}"),
+            ("POST", "/api/v1/pipelines/{pipeline_id}/tasks"),
         })
         self.assertEqual(self.client.get("/api/health").status_code, 200)
         self.assertEqual(self.client.get("/api/pipelines").status_code, 200)
@@ -1254,16 +1362,16 @@ class APITests(unittest.TestCase):
             response = self.upload(b"Document", filename, "text/plain")
             self.assertEqual(response.status_code, 200, response.text)
             ids.append(response.json()["documentId"])
-        first = self.client.get("/api/documents", params={"q": "invoice", "page_size": 1}).json()
-        second = self.client.get("/api/documents", params={"q": "invoice", "page_size": 1, "page": 1}).json()
+        first = self.client.get("/api/documents", params={"search": "invoice", "page_size": 1}).json()
+        second = self.client.get("/api/documents", params={"search": "invoice", "page_size": 1, "page": 1}).json()
         self.assertTrue(first["hasMore"])
         self.assertFalse(second["hasMore"])
         self.assertEqual({first["documents"][0]["id"], second["documents"][0]["id"]}, set(ids[:2]))
-        literal = self.client.get("/api/documents", params={"q": "%"}).json()
+        literal = self.client.get("/api/documents", params={"search": "%"}).json()
         self.assertEqual([row["id"] for row in literal["documents"]], [ids[0]])
-        exact = self.client.get("/api/documents", params={"q": ids[2]}).json()
+        exact = self.client.get("/api/documents", params={"search": ids[2]}).json()
         self.assertEqual([row["id"] for row in exact["documents"]], [ids[2]])
-        self.assertEqual(self.client.get("/api/documents", params={"q": "missing"}).json()["documents"], [])
+        self.assertEqual(self.client.get("/api/documents", params={"search": "missing"}).json()["documents"], [])
         self.assertNotIn("text", first["documents"][0])
         self.assertEqual(self.client.get("/api/documents?page_size=101").status_code, 422)
 
@@ -1277,8 +1385,8 @@ class APITests(unittest.TestCase):
         self.assertEqual(uploaded.status_code, 200)
         rows = self.client.get(f"/api/v1/documents?pipeline_id={pipeline_id}", headers=headers).json()["documents"]
         self.assertEqual([row["id"] for row in rows], [uploaded.json()["documentId"]])
-        self.assertEqual(self.client.get("/api/v1/documents?q=admin&page_size=20", headers=headers).json()["documents"], [])
-        self.assertEqual(len(self.client.get("/api/v1/documents?q=owned&page_size=20", headers=headers).json()["documents"]), 1)
+        self.assertEqual(self.client.get("/api/v1/documents?search=admin&page_size=20", headers=headers).json()["documents"], [])
+        self.assertEqual(len(self.client.get("/api/v1/documents?search=owned&page_size=20", headers=headers).json()["documents"]), 1)
         self.assertEqual(self.client.get("/api/history/pipelines", headers=headers).status_code, 403)
 
     def test_background_status_links_match_api_prefix(self):
@@ -1315,7 +1423,7 @@ class APITests(unittest.TestCase):
             self.assertFalse(stored["extraction"]["prompt_enabled"])
             self.assertFalse(stored["extraction"]["fields_enabled"])
             self.assertEqual(stored["extraction"]["prompt"], "Use the final total")
-            self.assertEqual(stored["extraction"]["fields"], [{"name":"total", "description":"", "public_description":"", "type":"string", "fields":[]}])
+            self.assertEqual(stored["extraction"]["fields"], [{"name":"total", "description":"", "type":"string", "fields":[]}])
         before = len(self.calls)
         job = self.submit_background(pipeline=stored)
         self.execute_background(job["taskId"])
@@ -1376,7 +1484,7 @@ class APITests(unittest.TestCase):
         token = self.issue_key(**{"name": "Typed", "pipeline_ids": [config["id"]]}).json()["token"]
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + token})
         contract = integration.get("/api/v1/pipelines").json()["pipelines"][0]
-        self.assertEqual(set(contract), {"id", "name", "description", "executionModes", "asyncConcurrency", "resultSchema"})
+        self.assertEqual(set(contract), {"id", "name", "executionModes", "asyncConcurrency", "resultSchema"})
         self.assertNotIn("SECRET", json.dumps(contract))
         self.assertEqual(contract["resultSchema"]["properties"]["objects"]["items"]["properties"]["count"]["type"], ["integer", "null"])
         self.assertEqual(integration.get("/api/pipelines").json()["pipelines"], [contract])

@@ -110,7 +110,7 @@ export default function HistoryPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    const query = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE), q: search });
+    const query = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE), search });
     if (pipelineId) query.set("pipeline_id", pipelineId);
     getJSON(`/api/documents?${query}`, { signal: controller.signal }).then((data) => {
       if (controller.signal.aborted) return;

@@ -9,12 +9,12 @@ from billiard.exceptions import SoftTimeLimitExceeded
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.exc import OperationalError
 
-from ..core.config import JobSettings
-from ..core.errors import DomainError, ProcessingTimeout
+from ..core.config import JobSettings, MAX_FILE_SIZE
+from ..core.errors import DomainError, InvalidDocument, ProcessingTimeout, UpstreamError
 from ..db.domain.models import Document, ProcessingJob
 from ..db.infra.repositories import DocumentRepository, JobRepository, SyncCapacityRepository, now
 from ..schema.pipeline import Pipeline, result_schema
-from ..core.security import redact, safe_url
+from ..core.security import check_external_url, redact, safe_url
 from .recognition import extract, recognize
 from .validation import result_fields
 
@@ -128,16 +128,44 @@ class ProcessingService:
             raise
         return job_id
 
+    def fetch_source(self, claimed, transport=None):
+        """Скачивает документ по ссылке и кладёт его в S3 как обычный оригинал.
+
+        Размер неизвестен заранее, поэтому тело читается потоком и обрывается на лимите:
+        иначе ссылка на бесконечный поток съела бы память воркера.
+        """
+        check_external_url(claimed.source_url, "Ссылка на документ")
+        chunks, total = [], 0
+        with httpx.Client(timeout=httpx.Timeout(120, connect=15), follow_redirects=True, transport=transport) as client:
+            with client.stream("GET", claimed.source_url) as response:
+                if response.status_code >= 400:
+                    raise UpstreamError.from_status(
+                        f"Документ по ссылке недоступен: HTTP {response.status_code}", response.status_code)
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_FILE_SIZE:
+                        raise InvalidDocument("Документ по ссылке больше 20 МБ")
+                    chunks.append(chunk)
+        content = b"".join(chunks)
+        if not content:
+            raise InvalidDocument("По ссылке пустой документ")
+        self.jobs.attach_original(claimed, self.originals.put(claimed.id, content, claimed.mime_type), len(content))
+        return content
+
     def execute(self, job_id, generation=None, transport=None):
         claimed = self.jobs.claim(job_id, generation)
         if claimed is None:
             return
         try:
-            path = self.originals.download(claimed.original_key)
-            try:
-                content = path.read_bytes()
-            finally:
-                path.unlink(missing_ok=True)
+            if claimed.original_key is None:
+                # Push-задача: файла ещё нет, его забирают по ссылке от внешней системы.
+                content = self.fetch_source(claimed, transport)
+            else:
+                path = self.originals.download(claimed.original_key)
+                try:
+                    content = path.read_bytes()
+                finally:
+                    path.unlink(missing_ok=True)
             parsed = Pipeline.model_validate(claimed.pipeline)
 
             async def process():

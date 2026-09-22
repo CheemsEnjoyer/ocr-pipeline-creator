@@ -1,6 +1,9 @@
+import ipaddress
 import logging
 import os
 import re
+import socket
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -52,3 +55,56 @@ def configure_logging():
         logger = logging.getLogger(name)
         if not any(isinstance(item, SecretFilter) for item in logger.filters):
             logger.addFilter(SecretFilter())
+
+
+RESOLVE_TTL = 60
+_resolved = {}
+
+
+def resolve(hostname):
+    """Адреса хоста с короткой памятью, включая отрицательный ответ.
+
+    Кэш здесь не оптимизация: без него каждая проверка адреса ждёт DNS, а имена,
+    которые не разрешаются, ждут полного таймаута резолвера. TTL короткий, потому
+    что проверка всё равно не спасает от смены записи между проверкой и запросом.
+    """
+    try:
+        return ipaddress.ip_address(hostname) and [hostname]
+    except ValueError:
+        pass
+    cached = _resolved.get(hostname)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        addresses = sorted({info[4][0] for info in socket.getaddrinfo(hostname, None)})
+    except socket.gaierror:
+        # Имя не разрешается — запрос всё равно не уйдёт, пусть падает на отправке.
+        addresses = []
+    _resolved[hostname] = (time.monotonic() + RESOLVE_TTL, addresses)
+    return addresses
+
+
+class UnsafeUrl(ValueError):
+    """Адрес, по которому серверу ходить нельзя."""
+
+
+def check_external_url(value, what="Адрес"):
+    """Пропускает только http(s) на внешний хост.
+
+    Ссылку на документ и адрес callback задаёт владелец ключа, а ходит по ним сервер.
+    Без этой проверки ключ превращается в инструмент для запросов во внутреннюю сеть
+    и к метаданным облака. Проверка не отменяет сетевых ограничений: DNS может
+    смениться между проверкой и запросом, поэтому доступ наружу стоит резать и файрволом.
+    """
+    if os.getenv("OCR_ALLOW_PRIVATE_URLS", "").strip() == "1":
+        return value
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"}:
+        raise UnsafeUrl(f"{what} должен начинаться с http:// или https://")
+    if not parts.hostname:
+        raise UnsafeUrl(f"{what} не содержит хоста")
+    for address in resolve(parts.hostname):
+        ip = ipaddress.ip_address(address)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise UnsafeUrl(f"{what} указывает на внутренний адрес")
+    return value

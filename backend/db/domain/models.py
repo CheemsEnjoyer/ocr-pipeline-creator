@@ -1,8 +1,5 @@
-from datetime import datetime, timezone
-from enum import Enum
-
-from sqlalchemy import JSON, DateTime, Enum as SAEnum, Float, Index, Integer, String, Text, UniqueConstraint, CheckConstraint, ForeignKey
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import JSON, Float, Index, Integer, String, Text, UniqueConstraint, CheckConstraint, ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import JSONB
 
 JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
@@ -11,6 +8,9 @@ JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 # записаться молча и застрять в истории.
 JOB_STATUSES = ("queued", "processing", "succeeded", "failed")
 JOB_STAGES = ("queued", "downloading", "recognition", "extraction", "validation", "saving", "completed", "failed")
+# Доставка результата во внешнюю систему. Живёт отдельно от статуса задачи:
+# документ может быть распознан, а callback не доставлен, и наоборот.
+CALLBACK_STATUSES = ("pending", "sent", "failed")
 
 
 def one_of(column, values, nullable=False):
@@ -20,50 +20,6 @@ def one_of(column, values, nullable=False):
 
 class Base(DeclarativeBase):
     pass
-
-
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    PROCESSING = "processing"
-    DONE = "done"
-    ERROR = "error"
-    RESPONSE_SENDING_ERROR = "response_sending_error"
-
-
-# Отдельный контекст: постановка задач внешней системой с ответом на callback.
-# С обработкой документов (Document, ProcessingJob) пока не связан — интеграция не достроена.
-class DocumentType(Base):
-    __tablename__ = "document_types"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(80), unique=True)
-
-
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id: Mapped[str] = mapped_column(String(80), primary_key=True)
-    document_type_id: Mapped[int] = mapped_column(ForeignKey("document_types.id"))
-    callback_url: Mapped[str] = mapped_column(Text)
-    status: Mapped[TaskStatus] = mapped_column(
-        SAEnum(TaskStatus, native_enum=False, create_constraint=True, name="task_status"),
-        default=TaskStatus.PENDING,
-    )
-    task_update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    task_completion_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    document_type: Mapped[DocumentType] = relationship()
-    file: Mapped["File | None"] = relationship(back_populates="task", cascade="all, delete-orphan", uselist=False)
-
-
-class File(Base):
-    __tablename__ = "task_files"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    s3_link: Mapped[str] = mapped_column(Text)
-    # Nullable: rows created before 0013 have no MIME, and the sender may omit it later.
-    content_type: Mapped[str | None] = mapped_column(Text, nullable=True)
-    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), unique=True)
-    task: Mapped[Task] = relationship(back_populates="file")
 
 
 class Document(Base):
@@ -112,6 +68,12 @@ class ProcessingJob(Base):
         Index("idx_processing_jobs_recover", "status", "updated_at", "id"),
         # claim() считает активные задачи пайплайна перед выдачей аренды.
         Index("idx_processing_jobs_pipeline", "pipeline_id", "status"),
+        # Код задачи назначает вызывающая система, поэтому он уникален внутри клиента,
+        # а не глобально: две учётные системы вправе прислать один и тот же код.
+        UniqueConstraint("client_id", "task_code", name="uq_processing_jobs_task_code"),
+        CheckConstraint(one_of("callback_status", CALLBACK_STATUSES, nullable=True), name="ck_processing_jobs_callback_status"),
+        # Диспетчер каждую секунду ищет задачи, чей результат пора отправить.
+        Index("idx_processing_jobs_callback", "callback_status", "callback_next_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -121,7 +83,9 @@ class ProcessingJob(Base):
     filename: Mapped[str] = mapped_column(Text)
     mime_type: Mapped[str] = mapped_column(Text)
     size: Mapped[int] = mapped_column(Integer)
-    original_key: Mapped[str] = mapped_column(Text)
+    # Пусто до скачивания: push-задача приходит ссылкой, файл забирает воркер.
+    original_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     pipeline: Mapped[dict] = mapped_column(JSON_TYPE)
     pipeline_id: Mapped[str | None] = mapped_column(String(80), ForeignKey("pipelines.id"), nullable=True)
     # Аудит: каким ключом поставлена. Доступ разграничивает client_id.
@@ -137,6 +101,13 @@ class ProcessingJob(Base):
     deadline_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_until: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Push-модель: код задачи внешней системы и адрес, куда вернуть результат.
+    task_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    callback_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    callback_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    callback_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    callback_next_at: Mapped[float] = mapped_column(Float, default=0, server_default="0")
+    callback_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class TaskOutbox(Base):

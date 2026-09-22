@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, HttpUrl, model_validator
 class ExtractionField(BaseModel):
     name: str
     description: str = ""
-    public_description: str = ""
     type: Literal["string", "number", "integer", "boolean", "object", "array"] = "string"
     fields: list["ExtractionField"] = Field(default_factory=list)
 
@@ -31,7 +30,9 @@ def validate_field_tree(fields, depth=1):
 def fields_schema(fields, public=False):
     properties = {}
     for field in fields:
-        schema = {"type": [field.type, "null"], "description": field.public_description if public else (field.description or field.public_description)}
+        schema = {"type": [field.type, "null"]}
+        if not public:
+            schema["description"] = field.description
         if field.type == "object":
             schema.update(fields_schema(field.fields, public))
             schema["type"] = ["object", "null"]
@@ -89,7 +90,6 @@ class Extraction(BaseModel):
 
 class Pipeline(BaseModel):
     name: str = "Untitled"
-    description: str = ""
     priority: int = Field(default=5, ge=0, le=9, strict=True)
     allow_sync: bool = True
     allow_async: bool = True

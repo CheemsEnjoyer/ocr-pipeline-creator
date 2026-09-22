@@ -39,6 +39,7 @@ def create_app(database_url=None, data_dir=None, transport=None):
             {"name": "Processing", "description": "Submit a document for processing."},
             {"name": "Jobs", "description": "Check the status of background jobs and retry failed jobs."},
             {"name": "Documents", "description": "Fetch recognition results."},
+            {"name": "Tasks", "description": "Register a task pushed by an external accounting system."},
         ],
         swagger_ui_parameters={"docExpansion": "none"},
     )
