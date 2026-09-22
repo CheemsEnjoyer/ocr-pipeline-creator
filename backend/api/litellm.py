@@ -1,16 +1,16 @@
 import json
 from fastapi import APIRouter, Depends, HTTPException
-from ..access import admin_only
-from ..processing import api_url, complete, litellm_config
-from ..schemas import ChatRequest
+from .policies import admin_only
+from ..handler import litellm as gateway
+from ..schema.api import ChatRequest
 
 
 def create_router(app, storage):
     router = APIRouter(tags=["LiteLLM Models"])
     @router.get("/api/litellm/models", dependencies=[Depends(admin_only)])
     async def models():
-        base, headers = litellm_config()
-        response = await app.state.client.get(api_url(base, "models"), headers=headers)
+        base, headers = gateway.litellm_config()
+        response = await app.state.client.get(gateway.api_url(base, "models"), headers=headers)
         if not response.is_success:
             raise HTTPException(503, f"LiteLLM вернул HTTP {response.status_code}")
         try:
@@ -22,7 +22,7 @@ def create_router(app, storage):
     @router.post("/api/litellm/chat", dependencies=[Depends(admin_only)])
     async def chat(payload: ChatRequest):
         schema = {field.get("name", ""): {"type": "string", "description": field.get("description", "")} for field in payload.fields}
-        result = await complete(app.state.client, {
+        result = await gateway.complete(app.state.client, {
             "model": payload.model, "temperature": 0, "max_tokens": payload.maxTokens,
             "response_format": {"type": "json_object"},
             "messages": [

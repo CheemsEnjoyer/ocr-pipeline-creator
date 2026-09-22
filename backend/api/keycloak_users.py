@@ -3,8 +3,8 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
-from ..access import admin_only
-from ..keycloak_admin import KeycloakAdmin
+from .policies import admin_only
+from ..handler.keycloak_admin import KeycloakAdmin
 
 
 class Invitation(BaseModel):

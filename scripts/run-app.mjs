@@ -76,14 +76,14 @@ async function requireFreePort(port) {
 function launchWorker() {
   const concurrency = Number(process.env.OCR_WORKER_CONCURRENCY || 4);
   if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("OCR_WORKER_CONCURRENCY должен быть положительным целым числом");
-  const worker = launch(python, ["-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", ...(windows ? ["--pool=solo"] : [`--concurrency=${concurrency}`])]);
+  const worker = launch(python, ["-m", "celery", "-A", "backend.worker.celery_app:celery_app", "worker", "--loglevel=info", ...(windows ? ["--pool=solo"] : [`--concurrency=${concurrency}`])]);
   worker.once("error", (error) => { console.error(error.message); stop(1); });
   worker.once("exit", (code) => { if (!stopping) stop(code || 1); });
   return worker;
 }
 
 function launchDispatcher() {
-  const dispatcher = launch(python, ["-m", "backend.dispatcher"]);
+  const dispatcher = launch(python, ["-m", "backend.worker.dispatcher"]);
   dispatcher.once("error", (error) => { console.error(error.message); stop(1); });
   dispatcher.once("exit", (code) => { if (!stopping) stop(code || 1); });
   return dispatcher;
@@ -93,7 +93,7 @@ try {
   await setup();
   if (mode === "setup") process.exit(0);
   if (mode === "migrate") {
-    await run(python, ["-m", "backend.migrate"]);
+    await run(python, ["-m", "backend.db.migrate"]);
     process.exit(0);
   }
   if (mode === "dispatcher") {
@@ -116,7 +116,7 @@ try {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Некорректный порт сервера");
     await requireFreePort(port);
   }
-  const backend = launch(python, ["-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", String(backendPort)]);
+  const backend = launch(python, ["-m", "uvicorn", "backend.server:app", "--host", "127.0.0.1", "--port", String(backendPort)]);
   backend.once("error", (error) => { console.error(error.message); stop(1); });
   backend.once("exit", (code) => { if (!stopping) stop(code || 1); });
   let ready = false;

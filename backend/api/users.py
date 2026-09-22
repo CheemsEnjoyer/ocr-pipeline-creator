@@ -7,10 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
-from ..access import admin_only, public, digest
-from ..accounts import hash_password, user_metadata
-from ..models import AdminSession, User, LoginGuard
-from ..repositories import now
+from ..core.secrets import digest
+from .policies import admin_only, public
+from ..service.accounts import hash_password, user_metadata
+from ..db.domain.models import AdminSession, User, LoginGuard
+from ..db.infra.repositories import now
 
 
 class Invite(BaseModel):

@@ -13,10 +13,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from backend.access import COOKIE
-from backend.keycloak import KeycloakSettings, digest
-from backend.main import create_app
-from backend.models import OIDCFlow, OIDCSession
+from backend.api.policies import COOKIE
+from backend.handler.keycloak import KeycloakSettings, digest
+from backend.server import create_app
+from backend.db.domain.models import OIDCFlow, OIDCSession
 from backend.tests import test_api as api_tests
 
 

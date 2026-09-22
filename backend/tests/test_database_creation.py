@@ -5,7 +5,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
-from backend.migrate import ensure_database
+from backend.db.migrate import ensure_database
 
 
 class DatabaseCreationTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class DatabaseCreationTests(unittest.TestCase):
         self.maintenance.dialect = dialect()
         self.connection = self.maintenance.connect.return_value.execution_options.return_value.__enter__.return_value
         self.connection.execute.return_value.scalar.return_value = None
-        self.opener = patch("backend.migrate.open_database", return_value=(self.maintenance, None))
+        self.opener = patch("backend.db.migrate.open_database", return_value=(self.maintenance, None))
         self.open_database = self.opener.start()
         self.addCleanup(self.opener.stop)
 

@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from uuid import uuid4
+from uuid import UUID, uuid4
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -14,16 +14,16 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, update
 from sqlalchemy import text as sql
 
-from backend.access import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
-from backend.database import AdminSession, APIKey, Document, ProcessingJob, configured_database_url, open_database
 from sqlalchemy.schema import CreateSchema, DropSchema
-from backend.main import MAX_FILE_SIZE, create_app
-from backend.processing import proxy_options
-from backend.storage import S3Storage, TemporaryFileResponse
-from backend.tasks import execute_job
-from backend.config import JobSettings
-from backend.dispatcher import dispatch_once
-from backend.models import LoginGuard, TaskOutbox
+
+from backend.core.config import JobSettings, MAX_FILE_SIZE, proxy_options
+from backend.db.domain.models import AdminSession, APIKey, Document, LoginGuard, ProcessingJob, TaskOutbox
+from backend.db.infra.engine import configured_database_url, open_database
+from backend.handler.storage import S3Storage, TemporaryFileResponse
+from backend.server import create_app
+from backend.service.throttle import FAILED_LOGIN_WINDOW, MAX_FAILED_LOGINS
+from backend.worker.dispatcher import dispatch_once
+from backend.worker.tasks import execute_job
 
 ADMIN_LOGIN = "admin"
 ADMIN_PASSWORD = "test-password-123"
@@ -63,7 +63,7 @@ class APITests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.s3_client = FakeS3Client()
         self.originals = S3Storage("test-bucket", "test/originals", self.s3_client)
-        s3_factory = patch("backend.main.S3Storage.from_env", return_value=self.originals)
+        s3_factory = patch("backend.core.lifespan.S3Storage.from_env", return_value=self.originals)
         s3_factory.start()
         self.addCleanup(s3_factory.stop)
         self.app = self.make_app()
@@ -126,13 +126,33 @@ class APITests(unittest.TestCase):
     def upload(self, content=b'{"total": 1250}', filename="test.json", mime="application/json", pipeline=None):
         return self.client.post("/api/pipeline/run", files={"file": (filename, content, mime)}, data={"pipeline": json.dumps(pipeline or {"source": "document", "name": "Тест"})})
 
+    def test_schema_documents_only_the_integration_api(self):
+        """В /api/docs отдаётся контракт выгрузки во внешние учётные системы — и только он.
+
+        Маршруты интерфейса продолжают работать: они скрыты из схемы, а не выключены.
+        """
+        schema = self.client.get("/api/openapi.json")
+        self.assertEqual(schema.status_code, 200, schema.text)
+        documented = {(method.upper(), path) for path, operations in schema.json()["paths"].items() for method in operations}
+        self.assertEqual(documented, {
+            ("GET", "/api/v1/pipelines"),
+            ("POST", "/api/v1/pipeline/run"),
+            ("POST", "/api/v1/pipelines/{pipeline_id}/run"),
+            ("GET", "/api/v1/jobs/{job_id}"),
+            ("POST", "/api/v1/jobs/{job_id}/retry"),
+            ("GET", "/api/v1/documents"),
+            ("GET", "/api/v1/documents/{document_id}"),
+        })
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
+        self.assertEqual(self.client.get("/api/pipelines").status_code, 200)
+
     def test_pipeline_catalog_and_run(self):
         self.assertEqual(self.client.get("/api/pipelines").json(), {"pipelines": []})
         config = {"id": "invoices_2026", "name": "Catalog test", "source": "scans", "ocr": {"provider": "litellm", "model": "vision", "temperature": 0.4}, "extraction": {"mode": "prompt", "model": "extract", "prompt": "JSON", "temperature": 0.7, "max_tokens": 512}}
         created = self.client.post("/api/pipelines", json=config)
         self.assertEqual(created.status_code, 201, created.text)
         pipeline = created.json()["pipeline"]
-        self.assertEqual(pipeline["id"], "invoices_2026")
+        self.assertEqual(UUID(pipeline["id"]).version, 4)
         listed = self.client.get("/api/pipelines").json()["pipelines"]
         self.assertEqual(listed, [pipeline])
         self.assertEqual(self.upload(b"image", "scan.png", "image/png", listed[0]).status_code, 200)
@@ -144,31 +164,29 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/pipelines/{pipeline['id']}").status_code, 200)
         self.assertEqual(self.client.get("/api/pipelines").json()["pipelines"], [])
 
-    def test_user_pipeline_id_validation_uniqueness_and_api_access(self):
-        config = {"id": "invoices_2026", "name": "Invoices", "source": "document", "extraction": None}
-        for invalid in (None, "", "bad id", "../other", "счета", "x" * 81, "bad\n"):
-            payload = {**config, "id": invalid}
-            if invalid is None:
-                payload.pop("id")
-            self.assertEqual(self.client.post("/api/pipelines", json=payload).status_code, 422)
+    def test_generated_pipeline_uuid_and_api_access(self):
+        config = {"name": "Invoices", "source": "document", "extraction": None}
         created = self.client.post("/api/pipelines", json=config)
         self.assertEqual(created.status_code, 201, created.text)
-        self.assertEqual(created.json()["pipeline"]["id"], config["id"])
-        self.assertEqual(self.client.post("/api/pipelines", json={**config, "name": "Duplicate"}).status_code, 409)
-        self.assertEqual(self.client.patch("/api/pipelines/invoices_2026", json={**config, "id": "renamed"}).status_code, 400)
-        key = self.issue_key(**{"name": "Integration", "pipeline_ids": [config["id"]]}).json()["token"]
+        pipeline_id = created.json()["pipeline"]["id"]
+        self.assertEqual(UUID(pipeline_id).version, 4)
+        self.assertEqual(str(UUID(pipeline_id)), pipeline_id)
+        duplicate = self.client.post("/api/pipelines", json={**config, "id": pipeline_id})
+        self.assertEqual(duplicate.status_code, 201, duplicate.text)
+        self.assertNotEqual(duplicate.json()["pipeline"]["id"], pipeline_id)
+        self.assertEqual(UUID(duplicate.json()["pipeline"]["id"]).version, 4)
+        self.assertEqual(self.client.patch(f"/api/pipelines/{pipeline_id}", json={**config, "id": "renamed"}).status_code, 400)
+        updated = self.client.patch(f"/api/pipelines/{pipeline_id}", json={**config, "name": "Updated"})
+        self.assertEqual(updated.json()["pipeline"]["id"], pipeline_id)
+        key = self.issue_key(**{"name": "Integration", "pipeline_ids": [pipeline_id]}).json()["token"]
         self.client.cookies.clear()
         headers = {"Authorization": f"Bearer {key}"}
         listed = self.client.get("/api/v1/pipelines", headers=headers).json()["pipelines"]
-        self.assertEqual(listed[0]["id"], config["id"])
-        self.assertEqual(listed[0]["name"], "Invoices")
-        result = self.client.post("/api/v1/pipelines/invoices_2026/run", headers=headers, files={"file": ("test.txt", b"Invoice 1500", "text/plain")})
+        self.assertEqual(listed[0]["id"], pipeline_id)
+        result = self.client.post(f"/api/v1/pipelines/{pipeline_id}/run", headers=headers, files={"file": ("test.txt", b"Invoice 1500", "text/plain")})
         self.assertEqual(result.status_code, 200, result.text)
         document = self.client.get(f"/api/v1/documents/{result.json()['documentId']}", headers=headers).json()["document"]
-        self.assertEqual(document["pipeline_id"], config["id"])
-        self.sign_in(self.client)
-        self.client.delete("/api/pipelines/invoices_2026")
-        self.assertEqual(self.client.post("/api/pipelines", json=config).status_code, 409)
+        self.assertEqual(document["pipeline_id"], pipeline_id)
 
     def test_pipeline_import_preserves_edits_and_deletions(self):
         legacy = {"id": "pl_legacy", "name": "Legacy", "source": "document", "extraction": None}
@@ -236,7 +254,7 @@ class APITests(unittest.TestCase):
                 self.assertEqual([json.loads(call.content)["temperature"] for call in self.calls], [temperatures.get("ocr", 0), temperatures.get("extraction", 0)])
 
     def test_pipeline_priority_reaches_celery_and_survives_retry(self):
-        from backend.tasks import enqueue_job, process_document
+        from backend.worker.tasks import enqueue_job, process_document
 
         pipeline = {"source": "document", "name": "Priority", "priority": 0,
                     "extraction": {"mode": "prompt", "model": "extract", "prompt": "Extract"}}
@@ -268,11 +286,13 @@ class APITests(unittest.TestCase):
     def test_pipeline_execution_modes_and_async_concurrency(self):
         async_config = {"id": "async_limited", "name": "Async", "source": "document",
                         "allow_sync": False, "allow_async": True, "async_concurrency": 1}
-        self.assertEqual(self.client.post("/api/pipelines", json=async_config).status_code, 201)
-        first = self.client.post("/api/pipeline/run?background=true", files={"file": ("1.txt", b"one", "text/plain")}, data={"pipeline_id": "async_limited"})
-        second = self.client.post("/api/pipeline/run?background=true", files={"file": ("2.txt", b"two", "text/plain")}, data={"pipeline_id": "async_limited"})
+        created = self.client.post("/api/pipelines", json=async_config)
+        self.assertEqual(created.status_code, 201, created.text)
+        async_id = created.json()["pipeline"]["id"]
+        first = self.client.post("/api/pipeline/run?background=true", files={"file": ("1.txt", b"one", "text/plain")}, data={"pipeline_id": async_id})
+        second = self.client.post("/api/pipeline/run?background=true", files={"file": ("2.txt", b"two", "text/plain")}, data={"pipeline_id": async_id})
         self.assertEqual((first.status_code, second.status_code), (202, 202))
-        self.assertEqual(self.client.post("/api/pipelines/async_limited/run?background=false", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
+        self.assertEqual(self.client.post(f"/api/pipelines/{async_id}/run?background=false", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
 
         clock = 1000
         claimed = self.app.state.processing.jobs.claim(first.json()["taskId"], clock=clock)
@@ -285,9 +305,11 @@ class APITests(unittest.TestCase):
         self.assertIsNotNone(self.app.state.processing.jobs.claim(second.json()["taskId"], generation=1, clock=clock + 2))
 
         sync_config = {"id": "sync_only", "name": "Sync", "source": "document", "allow_sync": True, "allow_async": False}
-        self.assertEqual(self.client.post("/api/pipelines", json=sync_config).status_code, 201)
-        self.assertEqual(self.client.post("/api/pipelines/sync_only/run", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 200)
-        self.assertEqual(self.client.post("/api/pipelines/sync_only/run?background=true", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
+        created = self.client.post("/api/pipelines", json=sync_config)
+        self.assertEqual(created.status_code, 201, created.text)
+        sync_id = created.json()["pipeline"]["id"]
+        self.assertEqual(self.client.post(f"/api/pipelines/{sync_id}/run", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/pipelines/{sync_id}/run?background=true", files={"file": ("x.txt", b"x", "text/plain")}).status_code, 400)
 
         maximum = self.client.post("/api/pipelines", json={"id": "max_concurrency", "name": "Maximum", "source": "document", "async_concurrency": 30})
         self.assertEqual(maximum.status_code, 201, maximum.text)
@@ -297,9 +319,9 @@ class APITests(unittest.TestCase):
             self.assertEqual(response.status_code, 422, response.text)
 
     def test_distributed_sync_capacity_limits_global_and_client_load(self):
-        from fastapi import HTTPException
-        from backend.models import IntegrationClient
-        from backend.repositories import SyncCapacityRepository
+        from backend.core.errors import LimitExceeded
+        from backend.db.domain.models import IntegrationClient
+        from backend.db.infra.repositories import SyncCapacityRepository
 
         first_client, second_client = str(uuid4()), str(uuid4())
         with self.app.state.sessions.begin() as session:
@@ -311,13 +333,13 @@ class APITests(unittest.TestCase):
         capacity = SyncCapacityRepository(self.app.state.sessions, settings)
         first = capacity.acquire(first_client, clock=1000)
         second = capacity.acquire(first_client, clock=1000)
-        with self.assertRaises(HTTPException) as client_error:
+        with self.assertRaises(LimitExceeded) as client_error:
             capacity.acquire(first_client, clock=1000)
-        self.assertEqual((client_error.exception.status_code, client_error.exception.headers["Retry-After"]), (429, "5"))
+        self.assertEqual((client_error.exception.status, client_error.exception.headers["Retry-After"]), (429, "5"))
         third = capacity.acquire(second_client, clock=1000)
-        with self.assertRaises(HTTPException) as global_error:
+        with self.assertRaises(LimitExceeded) as global_error:
             capacity.acquire(second_client, clock=1000)
-        self.assertEqual(global_error.exception.status_code, 429)
+        self.assertEqual(global_error.exception.status, 429)
         capacity.release(first)
         replacement = capacity.acquire(second_client, clock=1001)
         # Leases left behind by a crashed API process stop counting after timeout + grace period.
@@ -352,7 +374,7 @@ class APITests(unittest.TestCase):
     def test_prompt_result_preserves_paragraphs(self):
         result = "Общее описание документа.\n\nВторой абзац с выводами."
         pipeline = {"source": "document", "extraction": {"mode": "prompt", "model": "extract", "prompt": "Опиши документ"}}
-        with patch("backend.processing.complete", return_value=result) as completion:
+        with patch("backend.handler.litellm.complete", return_value=result) as completion:
             response = self.upload(pipeline=pipeline)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertNotIn("response_format", completion.call_args.args[1])
@@ -400,7 +422,7 @@ class APITests(unittest.TestCase):
                 self.assertEqual(app.state.proxy, "http://proxy.company.local:8080")
 
     def create_pipeline(self, name):
-        response = self.client.post("/api/pipelines", json={"id": f"test_{uuid4().hex}", "name": name, "source": "document", "extraction": None})
+        response = self.client.post("/api/pipelines", json={"name": name, "source": "document", "extraction": None})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["pipeline"]["id"]
 
@@ -614,7 +636,10 @@ class APITests(unittest.TestCase):
             with app.state.sessions() as session:
                 inspector = inspect(session.get_bind())
                 self.assertLessEqual({"pipeline_id", "api_key_id"}, {column["name"] for column in inspector.get_columns("documents")})
-                self.assertIn("idx_documents_api_key", {index["name"] for index in inspector.get_indexes("documents")})
+                indexes = {index["name"] for index in inspector.get_indexes("documents")}
+                self.assertIn("idx_documents_pipeline", indexes)
+                # По api_key_id не фильтруют: индекс снят, колонка осталась как аудит.
+                self.assertNotIn("idx_documents_api_key", indexes)
             old = client.get("/api/documents/old-doc").json()["document"]
             self.assertEqual((old["filename"], old["fields"], old["pipeline_id"]), ("old.txt", {}, None))
             pipeline = client.post("/api/pipelines", json={"id": "new_pipeline", "name": "Новый", "source": "document", "extraction": None}).json()["pipeline"]["id"]
@@ -630,14 +655,14 @@ class APITests(unittest.TestCase):
     def test_existing_keys_documents_and_jobs_receive_client_owner(self):
         from alembic import command
         from alembic.config import Config
-        from backend.models import IntegrationClient
+        from backend.db.domain.models import IntegrationClient
 
         migration_storage = self.storage / "owned-migration"
         migration_storage.mkdir()
         database = self.database_for(migration_storage)
         engine = create_engine(database)
         config = Config()
-        config.set_main_option("script_location", str(Path(__file__).parents[1] / "migrations"))
+        config.set_main_option("script_location", str(Path(__file__).parents[1] / "db" / "migration"))
         with engine.begin() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "0007_result_schema")
@@ -655,6 +680,34 @@ class APITests(unittest.TestCase):
             self.assertEqual((session.get(IntegrationClient, "old-key").name, session.get(IntegrationClient, "old-key").pipeline_ids), ("Legacy", ["invoice"]))
             self.assertEqual(session.get(Document, "old-doc").client_id, "old-key")
             self.assertEqual(session.get(ProcessingJob, "old-job").client_id, "old-key")
+        migrated_engine.dispose()
+        engine.dispose()
+
+    def test_dangling_pipeline_reference_is_restored_as_a_deleted_pipeline(self):
+        from alembic import command
+        from alembic.config import Config
+        from backend.db.domain.models import SavedPipeline
+
+        migration_storage = self.storage / "dangling-migration"
+        migration_storage.mkdir()
+        database = self.database_for(migration_storage)
+        engine = create_engine(database)
+        config = Config()
+        config.set_main_option("script_location", str(Path(__file__).parents[1] / "db" / "migration"))
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0011_job_stages")
+            # Пайплайн удалён физически прежней версией: ссылка осталась висячей.
+            connection.execute(sql("INSERT INTO documents (id, filename, mime_type, size, pipeline_name, original_key, text, result, fields, created_at, updated_at, revision, pipeline_id, api_key_id, result_schema) VALUES ('orphan-doc', 'old.txt', 'text/plain', 3, 'Исчезнувший', 'orphan', 'abc', 'abc', '{}', '2025', '2025', 0, 'vanished', NULL, '{\"type\":\"string\"}')"))
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+        migrated_engine, sessions = open_database(database)
+        with sessions() as session:
+            restored = session.get(SavedPipeline, "vanished")
+            self.assertEqual((restored.deleted, restored.config["name"]), (1, "Исчезнувший"))
+            # Ссылка сохранена, а значит история по пайплайну продолжает фильтроваться.
+            self.assertEqual(session.get(Document, "orphan-doc").pipeline_id, "vanished")
         migrated_engine.dispose()
         engine.dispose()
 
@@ -796,12 +849,13 @@ class APITests(unittest.TestCase):
     def test_background_processing_and_redelivery_do_not_duplicate_documents(self):
         job = self.submit_background(pipeline={"source": "document", "extraction": {"mode": "fields", "model": "extract", "fields": [{"name": "total"}, {"name": "missing"}]}})
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "queued")
+        self.assertEqual((self.client.get(job["statusUrl"]).json()["status"], self.client.get(job["statusUrl"]).json()["stage"]), ("queued", "queued"))
         self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
         self.execute_background(job["taskId"])
         self.execute_background(job["taskId"])
         status = self.client.get(job["statusUrl"]).json()
-        self.assertEqual((status["status"], status["text"], status["documentId"]), ("succeeded", "background text", job["taskId"]))
+        self.assertEqual((status["status"], status["stage"], status["text"], status["documentId"]), ("succeeded", "completed", "background text", job["taskId"]))
+        self.assertNotIn("failedStage", status)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(self.client.get("/api/documents").json()["documents"]), 1)
         document = self.client.get(f"/api/documents/{job['taskId']}").json()["document"]
@@ -816,25 +870,29 @@ class APITests(unittest.TestCase):
         self.execute_background(job["taskId"])
         status = self.client.get(job["statusUrl"]).json()
         self.assertEqual(status["status"], "failed")
+        self.assertEqual((status["stage"], status["failedStage"]), ("failed", "extraction"))
         self.assertIn("LiteLLM", status["error"])
         self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
         self.fail_upstream = False
         self.assertEqual(self.client.post(job["statusUrl"] + "/retry").status_code, 202)
         self.execute_background(job["taskId"])
-        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
+        retried = self.client.get(job["statusUrl"]).json()
+        self.assertEqual((retried["status"], retried["stage"]), ("succeeded", "completed"))
+        self.assertNotIn("failedStage", retried)
         self.assertEqual(self.client.post(job["statusUrl"] + "/retry").status_code, 409)
 
     def test_invalid_structured_output_is_not_saved_synchronously_or_by_worker(self):
         pipeline = {"source": "document", "extraction": {"mode": "fields", "model": "extract", "fields": [{"name": "total"}]}}
         invalid = '{"total":1500,"extra":"unrequested"}'
-        with patch("backend.processing.complete", return_value=invalid):
+        with patch("backend.handler.litellm.complete", return_value=invalid):
             response = self.upload(pipeline=pipeline)
         self.assertEqual(response.status_code, 502)
         self.assertEqual(self.s3_client.objects, {})
         job = self.submit_background(pipeline=pipeline)
-        with patch("backend.processing.complete", return_value=invalid):
+        with patch("backend.handler.litellm.complete", return_value=invalid):
             self.execute_background(job["taskId"])
-        self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "failed")
+        failed = self.client.get(job["statusUrl"]).json()
+        self.assertEqual((failed["status"], failed["stage"], failed["failedStage"]), ("failed", "failed", "validation"))
         self.assertEqual(self.client.get("/api/documents").json()["documents"], [])
 
     def test_background_jobs_are_private_to_their_api_key(self):
@@ -943,7 +1001,7 @@ class APITests(unittest.TestCase):
         import time
         from celery import Celery
         from celery.contrib.testing.worker import start_worker
-        from backend.tasks import process_document
+        from backend.worker.tasks import process_document
         test_celery = Celery("ocr_test", broker="memory://")
         test_celery.conf.update(task_ignore_result=True, task_serializer="json", accept_content=["json"])
         task = test_celery.task(process_document.run, name="ocr.process_document")
@@ -970,9 +1028,37 @@ class APITests(unittest.TestCase):
             self.execute_background(job["taskId"])
             self.assertEqual(client.get(job["statusUrl"]).json()["status"], "succeeded")
 
+    def test_published_events_of_finished_jobs_are_pruned(self):
+        import time
+        from backend.db.infra.repositories import OutboxRepository
+        settings = JobSettings()
+        repository = OutboxRepository(self.app.state.sessions, settings)
+        queued = self.submit_background()
+        finished = self.submit_background()
+        with self.app.state.sessions.begin() as session:
+            session.get(ProcessingJob, finished["taskId"]).status = "succeeded"
+        moment = time.time()
+        for _ in range(2):
+            event = repository.claim(clock=moment)
+            repository.finish(event, True, clock=moment)
+        # Свежие события не трогаем: их ещё может потребоваться перевыпустить.
+        self.assertEqual(repository.prune(clock=moment), 0)
+        self.assertEqual(repository.prune(clock=moment + settings.lease + 1), 1)
+        with self.app.state.sessions() as session:
+            remaining = session.scalars(select(TaskOutbox.job_id)).all()
+        self.assertEqual(remaining, [queued["taskId"]])
+
+    def test_unknown_job_status_and_stage_are_rejected_by_the_database(self):
+        from sqlalchemy.exc import IntegrityError
+        job = self.submit_background()
+        for column, value in (("status", "half-done"), ("stage", "thinking"), ("failed_stage", "thinking")):
+            with self.subTest(column=column), self.assertRaises(IntegrityError):
+                with self.app.state.sessions.begin() as session:
+                    session.execute(update(ProcessingJob).where(ProcessingJob.id == job["taskId"]).values(**{column: value}))
+
     def test_outbox_recovers_lost_dispatcher_and_fences_stale_receipts(self):
         import time
-        from backend.repositories import OutboxRepository
+        from backend.db.infra.repositories import OutboxRepository
         job = self.submit_background()
         repository = OutboxRepository(self.app.state.sessions, JobSettings())
         first = repository.claim()
@@ -986,9 +1072,9 @@ class APITests(unittest.TestCase):
 
     def test_worker_lease_prevents_parallel_claim_and_stale_completion(self):
         import time
-        from backend.repositories import JobRepository
-        from backend.services import build_document
-        from backend.processing import Pipeline
+        from backend.db.infra.repositories import JobRepository
+        from backend.schema.pipeline import Pipeline
+        from backend.service.processing import build_document
         job = self.submit_background()
         repository = JobRepository(self.app.state.sessions, JobSettings())
         first = repository.claim(job["taskId"], clock=time.time() - 301)
@@ -1003,7 +1089,7 @@ class APITests(unittest.TestCase):
 
     def test_expired_worker_is_requeued_and_old_generation_is_ignored(self):
         import time
-        from backend.repositories import JobRepository, OutboxRepository
+        from backend.db.infra.repositories import JobRepository, OutboxRepository
         job = self.submit_background()
         repository = JobRepository(self.app.state.sessions, JobSettings())
         old = repository.claim(job["taskId"], clock=time.time() - 301)
@@ -1044,7 +1130,7 @@ class APITests(unittest.TestCase):
         with self.app.state.sessions.begin() as session:
             row = session.get(ProcessingJob, expired["taskId"])
             row.status, row.deadline_at, row.lease_until = "processing", time.time() - 1, time.time() + 100
-        from backend.repositories import OutboxRepository
+        from backend.db.infra.repositories import OutboxRepository
         OutboxRepository(self.app.state.sessions, JobSettings()).recover()
         self.assertEqual(self.client.get(expired["statusUrl"]).json()["status"], "failed")
 
@@ -1060,10 +1146,10 @@ class APITests(unittest.TestCase):
             event.listen(engine, name, callback)
             self.addCleanup(event.remove, engine, name, callback)
         job = self.submit_background()
-        async def process(*args):
+        async def process(*args, **kwargs):
             self.assertEqual(active[0], 0)
             return "text", "text"
-        with patch("backend.services.process_pipeline", side_effect=process):
+        with patch("backend.service.processing.process_pipeline", side_effect=process):
             self.execute_background(job["taskId"])
         self.assertEqual(active[0], 0)
         self.assertEqual(self.client.get(job["statusUrl"]).json()["status"], "succeeded")
@@ -1081,7 +1167,7 @@ class APITests(unittest.TestCase):
         self.app.state.processing.settings = JobSettings(timeout=1)
         async def slow(*args):
             await asyncio.sleep(5)
-        with patch("backend.services.recognize", side_effect=slow):
+        with patch("backend.service.processing.recognize", side_effect=slow):
             response = self.upload()
         self.assertEqual(response.status_code, 504)
         self.assertEqual(self.s3_client.objects, {})
@@ -1102,11 +1188,12 @@ class APITests(unittest.TestCase):
         from alembic import command
         from alembic.config import Config
         from sqlalchemy.dialects.postgresql import JSONB, JSON
-        from backend.migrate import migrate
+        from backend.db.migrate import migrate
         columns = [("documents", "fields"), ("processing_jobs", "pipeline"), ("pipelines", "config"), ("integration_clients", "pipeline_ids"), ("login_guard", "failures")]
         payload = {"id":"jsonb_test", "name":"JSONB тест", "source":"document"}
-        self.assertEqual(self.client.post("/api/pipelines", json=payload).status_code, 201)
-        self.assertEqual(self.issue_key(**{"name":"JSONB key", "pipeline_ids":["jsonb_test"]}).status_code, 201)
+        created = self.client.post("/api/pipelines", json=payload)
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertEqual(self.issue_key(**{"name":"JSONB key", "pipeline_ids":[created.json()["pipeline"]["id"]]}).status_code, 201)
         self.assertEqual(self.upload(b'{"nested":{"amount":1500,"items":[true,null,"text"]}}').status_code, 200)
         self.submit_background(pipeline={"name":"JSONB задача", "source":"document"})
         self.client.post("/api/auth/login", json={"login":"wrong", "password":"wrong"})
@@ -1124,7 +1211,7 @@ class APITests(unittest.TestCase):
         before = snapshot()
         assert_types(JSONB)
         config = Config()
-        config.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "migrations"))
+        config.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "db" / "migration"))
         with engine.begin() as connection:
             config.attributes["connection"] = connection
             command.downgrade(config, "0002_reliable_jobs")
@@ -1136,7 +1223,7 @@ class APITests(unittest.TestCase):
 
     def test_history_pipeline_filter_paginates_and_preserves_deleted_history(self):
         for pipeline_id in ("first", "second", "all"):
-            self.assertEqual(self.client.post("/api/pipelines", json={"id":pipeline_id, "name":"Same name", "source":"document"}).status_code, 201)
+            self.assertEqual(self.client.post("/api/pipelines/import", json=[{"id":pipeline_id, "name":"Same name", "source":"document"}]).status_code, 200)
         first = self.client.post("/api/pipelines/first/run", files={"file":("first.txt", b"first", "text/plain")}).json()["documentId"]
         self.client.post("/api/pipelines/second/run", files={"file":("second.txt", b"second", "text/plain")})
         self.upload(b"Without pipeline", "test.txt", "text/plain")
@@ -1181,14 +1268,14 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/documents?page_size=101").status_code, 422)
 
     def test_history_pipeline_filter_keeps_integration_ownership(self):
-        self.client.post("/api/pipelines", json={"id":"owned", "name":"Owned", "source":"document"})
-        self.client.post("/api/pipelines/owned/run", files={"file":("admin.txt", b"Admin document", "text/plain")})
-        token = self.issue_key(**{"name":"Integration", "pipeline_ids":["owned"]}).json()["token"]
+        pipeline_id = self.create_pipeline("Owned")
+        self.client.post(f"/api/pipelines/{pipeline_id}/run", files={"file":("admin.txt", b"Admin document", "text/plain")})
+        token = self.issue_key(**{"name":"Integration", "pipeline_ids":[pipeline_id]}).json()["token"]
         self.client.cookies.clear()
         headers = {"Authorization":f"Bearer {token}"}
-        uploaded = self.client.post("/api/v1/pipelines/owned/run", headers=headers, files={"file":("owned.txt", b"Own document", "text/plain")})
+        uploaded = self.client.post(f"/api/v1/pipelines/{pipeline_id}/run", headers=headers, files={"file":("owned.txt", b"Own document", "text/plain")})
         self.assertEqual(uploaded.status_code, 200)
-        rows = self.client.get("/api/v1/documents?pipeline_id=owned", headers=headers).json()["documents"]
+        rows = self.client.get(f"/api/v1/documents?pipeline_id={pipeline_id}", headers=headers).json()["documents"]
         self.assertEqual([row["id"] for row in rows], [uploaded.json()["documentId"]])
         self.assertEqual(self.client.get("/api/v1/documents?q=admin&page_size=20", headers=headers).json()["documents"], [])
         self.assertEqual(len(self.client.get("/api/v1/documents?q=owned&page_size=20", headers=headers).json()["documents"]), 1)
@@ -1206,7 +1293,7 @@ class APITests(unittest.TestCase):
     def test_migrated_schema_matches_models(self):
         from alembic.autogenerate import compare_metadata
         from alembic.migration import MigrationContext
-        from backend.models import Base
+        from backend.db.domain.models import Base
         with self.app.state.sessions.kw["bind"].connect() as connection:
             context = MigrationContext.configure(connection, opts={"compare_type": True})
             self.assertEqual(compare_metadata(context, Base.metadata), [])
@@ -1221,7 +1308,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(json.loads(result.json()["result"]), {"total":"1500"})
         self.assertIn("Use the final total", json.loads(self.calls[-1].content)["messages"][0]["content"])
         saved["extraction"].update(prompt_enabled=False, fields_enabled=False)
-        changed = self.client.patch("/api/pipelines/combined", json=saved)
+        changed = self.client.patch(f"/api/pipelines/{saved['id']}", json=saved)
         self.assertEqual(changed.status_code, 200, changed.text)
         with self.restarted_app() as restarted:
             stored = restarted.get("/api/pipelines").json()["pipelines"][0]
@@ -1245,7 +1332,7 @@ class APITests(unittest.TestCase):
     @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "PostgreSQL required for shared row locking")
     def test_concurrent_login_guards_do_not_lose_failures(self):
         from concurrent.futures import ThreadPoolExecutor
-        from backend.throttle import LoginThrottle
+        from backend.service.throttle import LoginThrottle
         guards = [LoginThrottle(self.app.state.sessions), LoginThrottle(self.app.state.sessions)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda index: guards[index % 2].verify(lambda: False), range(16)))
@@ -1260,7 +1347,7 @@ class APITests(unittest.TestCase):
         import sys
         target = self.database_for(self.storage)
         environment = {**os.environ, "DATABASE_URL": target.render_as_string(hide_password=False)}
-        processes = [subprocess.Popen([sys.executable, "-m", "backend.migrate"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        processes = [subprocess.Popen([sys.executable, "-m", "backend.db.migrate"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
         try:
             for process in processes:
                 stdout, stderr = process.communicate(timeout=30)
@@ -1285,7 +1372,8 @@ class APITests(unittest.TestCase):
             "description": "SECRET RULE", "public_description": "Objects", "fields": [{"name": "count", "type": "integer", "public_description": "Count"}]}]}}
         created = self.client.post("/api/pipelines", json=config)
         self.assertEqual(created.status_code, 201, created.text)
-        token = self.issue_key(**{"name": "Typed", "pipeline_ids": ["typed"]}).json()["token"]
+        config["id"] = created.json()["pipeline"]["id"]
+        token = self.issue_key(**{"name": "Typed", "pipeline_ids": [config["id"]]}).json()["token"]
         integration = TestClient(self.app, headers={"Authorization": "Bearer " + token})
         contract = integration.get("/api/v1/pipelines").json()["pipelines"][0]
         self.assertEqual(set(contract), {"id", "name", "description", "executionModes", "asyncConcurrency", "resultSchema"})
@@ -1295,21 +1383,21 @@ class APITests(unittest.TestCase):
         self.assertIn("extraction", self.client.get("/api/pipelines").json()["pipelines"][0])
         expected = {"objects": [{"count": 3}]}
         from unittest.mock import AsyncMock
-        with patch("backend.processing.complete", new=AsyncMock(return_value=json.dumps(expected))):
-            response = self.send_document(integration, "/api/v1/pipelines/typed/run")
+        with patch("backend.handler.litellm.complete", new=AsyncMock(return_value=json.dumps(expected))):
+            response = self.send_document(integration, f"/api/v1/pipelines/{config['id']}/run")
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["result"], expected)
             doc_id = response.json()["documentId"]
-            queued = self.send_document(integration, "/api/v1/pipelines/typed/run?background=true").json()
+            queued = self.send_document(integration, f"/api/v1/pipelines/{config['id']}/run?background=true").json()
             self.app.state.processing.execute(queued["taskId"])
         self.assertEqual(integration.get(f"/api/v1/jobs/{queued['taskId']}").json()["result"], expected)
         self.assertEqual(integration.get(f"/api/v1/documents/{doc_id}").json()["document"]["result"], expected)
         # Result contract survives config changes and edits to the separate operator fields.
-        self.client.patch("/api/pipelines/typed", json={**config, "extraction": None})
+        self.client.patch(f"/api/pipelines/{config['id']}", json={**config, "extraction": None})
         self.client.patch(f"/api/documents/{doc_id}", json={"fields": {}, "revision": 0})
         self.assertEqual(integration.get(f"/api/v1/documents/{doc_id}").json()["document"]["result"], expected)
         self.assertEqual(integration.get("/api/v1/pipelines").json()["pipelines"][0]["resultSchema"], {"type": "string"})
-        raw = integration.post("/api/v1/pipelines/typed/run", files={"file": ("x.txt", b'{"hello":123}', "text/plain")})
+        raw = integration.post(f"/api/v1/pipelines/{config['id']}/run", files={"file": ("x.txt", b'{"hello":123}', "text/plain")})
         self.assertEqual(raw.json()["result"], '{"hello":123}')
         self.assertEqual(integration.get(f"/api/v1/documents/{raw.json()['documentId']}").json()["document"]["result"], '{"hello":123}')
 

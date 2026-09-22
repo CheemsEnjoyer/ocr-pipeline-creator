@@ -152,7 +152,11 @@ curl -H "Authorization: Bearer ocr_..." -F "file=@scan.pdf" \
 
 Ответ HTTP 202 содержит `taskId`, `status` и `statusUrl`.
 Запрашивайте `GET /api/v1/jobs/{taskId}` с тем же ключом. При `succeeded`
-ответ содержит `documentId`, `text` и `result`; при `failed` — `error`.
+ответ содержит `documentId`, `text` и `result`; при `failed` — `error` и `failedStage`.
+Поле `stage` доступно во всех состояниях и принимает значения `queued`, `downloading`,
+`recognition`, `extraction`, `validation`, `saving`, `completed` или `failed`.
+При автоматическом повторе задача снова получает `stage=queued`, а `failedStage` сохраняет
+этап предыдущего сбоя. После успешного завершения `failedStage` удаляется.
 Ключ видит только задачи своего клиента в разрешённых пайплайнах, администратор — все. Отозванный ключ теряет доступ.
 `background=true` явно выбирает асинхронный режим, `background=false` — синхронный.
 Если параметр не передан, API выбирает синхронный режим, когда он разрешён, иначе
@@ -240,12 +244,11 @@ PostgreSQL, S3, LiteLLM и прокси, что API; диспетчеру — Po
 Миграция `0004_users` добавляет таблицу пользователей и связывает с ней сессии;
 старые сессии основного администратора продолжают работать.
 
-При создании пайплайна укажите собственный уникальный **ID**, например `invoices_2026`.
-Допустимы 1–80 латинских букв, цифр, `_` и `-`; регистр учитывается.
-Этот ID передаётся в API: `/api/v1/pipelines/invoices_2026/run`.
-После сохранения ID доступен только для чтения; существующие пайплайны сохраняют свои ID.
-При `POST /api/pipelines` поле `id` обязательно. Занятый ID возвращает HTTP 409,
-в том числе после удаления пайплайна: это предотвращает повторное использование прав старых ключей.
+При создании пайплайна сервер автоматически генерирует **ID в формате UUID v4**.
+В `POST /api/pipelines` передаётся конфигурация без `id`; созданный ID возвращается в `pipeline.id`.
+Этот ID используется в API: `/api/v1/pipelines/{id}/run`.
+После сохранения ID доступен только для чтения. Существующие пайплайны и импорт
+старых конфигураций сохраняют свои ID; изменить ID через `PATCH` нельзя.
 
 Интерфейс и API закрыты. В интерфейс входят по логину и паролю администратора: задайте `OCR_ADMIN_LOGIN` и `OCR_ADMIN_PASSWORD` в `.env` (пароль не короче 8 символов). Без `OCR_ADMIN_LOGIN` логин — `admin`. Без `OCR_ADMIN_PASSWORD` сервер при первом запуске генерирует пароль и сохраняет его в `data/admin-password.txt`; путь пишется в лог. После входа браузер получает сессию на 12 часов (cookie `HttpOnly`, `SameSite=Strict`); при работе по HTTPS добавьте `OCR_SECURE_COOKIE=1`. Смена логина или пароля завершает все открытые сессии.
 
@@ -266,6 +269,14 @@ PostgreSQL, S3, LiteLLM и прокси, что API; диспетчеру — Po
 Ключ видит только документы, которые обработал сам. Документы других ключей, загруженные через интерфейс и обработанные до появления этой возможности, для него не существуют — сервер отвечает 404. Если ключ отозвать и выпустить новый, документы старого ключа новому недоступны, а в истории у администратора они остаются. Исходный файл и правка полей ключу недоступны.
 
 `/v1` — API интеграций. Изменение контракта: список пайплайнов теперь содержит публичную схему вместо конфигурации, а структурированный `result` возвращается объектом вместо JSON-строки. Обновите клиентов, вызывавших `JSON.parse(result)`. Адреса без версии (`/api/pipelines`, `/api/pipelines/{id}/run`, `/api/pipeline/run`) тоже остаются рабочими: ими пользуется интерфейс и уже подключённые системы. Служебные разделы — ключи, вход, исходные файлы и правка документов — под `/api/v1` не публикуются.
+
+Swagger на `/api/docs` (и схема `/api/openapi.json`) описывает только эти семь маршрутов
+`/api/v1` — контракт выгрузки во внешние учётные системы. Маршруты интерфейса
+(вход, пользователи, ключи, клиенты, LiteLLM, история и правка документов, версии без
+`/v1`, `/api/health`) помечены `include_in_schema=False`: они работают как прежде, но в
+документации не показываются, чтобы интегратор видел ровно свой контракт. Состав схемы
+закреплён тестом `test_schema_documents_only_the_integration_api` — новый маршрут не
+попадёт в публичную документацию молча.
 
 Передать свою конфигурацию пайплайна, открыть общую историю документов, настройки или другие ключи с ключом интеграции нельзя — сервер отвечает 403. Отозванный ключ получает 401. Пароль администратора в заголовке `Authorization` не принимается — только ключи интеграций.
 
@@ -317,7 +328,7 @@ JSON-колонки PostgreSQL используют `JSONB`: поля докум
 - `data/admin-password.txt` — сгенерированный пароль администратора, если `OCR_ADMIN_PASSWORD` не задан.
 - Пайплайны доступны через API; при открытии списка ранее сохранённые конфигурации из браузера автоматически импортируются на сервер.
 
-Схемой управляет Alembic: миграции лежат в `backend/migrations/versions`, версия —
+Схемой управляет Alembic: миграции лежат в `backend/db/migration/versions`, версия —
 в таблице `alembic_version`. API применяет миграции при старте, Docker делает это также
 отдельным сервисом до запуска остальных процессов. Для отдельного обновления выполните
 `npm run migrate`. Миграции PostgreSQL сериализуются advisory lock, поэтому параллельные
@@ -332,24 +343,29 @@ JSON-колонки PostgreSQL используют `JSONB`: поля докум
 
 ## TaskService
 
-`backend.task_service.TaskService` (также доступен из `backend.services`) хранит задачи
+`backend.service.tasks.TaskService` хранит задачи
 и ссылки на их файлы. Миграция `0006_tasks` создаёт таблицы и тип документа `generic`.
 Тип передаётся в поле `document_type` DTO (по умолчанию `generic`); другие типы должны
 быть предварительно добавлены в `document_types`.
+Поле `content_type` — это MIME-тип файла по `document_link` (в ссылке расширения может
+не быть); оно обязательное, не проверяется на формат и сохраняется в `task_files`
+(миграция `0013_task_content_type`, колонка nullable ради ранее созданных строк).
+Набор полей DTO повторяет контракт внешней системы постановки задач.
 Сервис предоставляет `create_task`, `update_task_status`, `get_status_by_code`,
 `is_task_existing` и `get_task_data`. Это слой хранения: запуск OCR и отправка callback
 в него пока не подключены.
 
 ```python
-from backend.models import TaskStatus
-from backend.schemas import InitTaskRequestDTO
-from backend.task_service import TaskService
+from backend.db.domain.models import TaskStatus
+from backend.schema.api import InitTaskRequestDTO
+from backend.service.tasks import TaskService
 
 with sessions() as db:
     TaskService.create_task(InitTaskRequestDTO(
         task_code="task-123",
         callback_url="https://integration.example/callback",
         document_link="s3://documents/input.pdf",
+        content_type="application/pdf",
     ), db)
     TaskService.update_task_status("task-123", TaskStatus.PROCESSING, db)
 ```
@@ -398,18 +414,20 @@ API дополнительно проверяет JSON, точный соста�
 
 ## Архитектура и команды
 
-- `backend/main.py` — сборка FastAPI, жизненный цикл и обработчики ошибок.
+Бэкенд разложен по слоям: слой выше знает о слое ниже, обратных зависимостей нет.
+Бизнес-логика не импортирует FastAPI — она возбуждает ошибки из `backend/core/errors.py`,
+а в HTTP-ответ их превращает единственный обработчик в `backend/server.py`.
+
+- `backend/server.py` — сборка FastAPI, маршрутизация и обработчики ошибок.
+- `backend/core/` — конфигурация и прокси (`config.py`), скрытие секретов и логи (`security.py`), доменные ошибки (`errors.py`), учётные данные администратора (`secrets.py`), жизненный цикл приложения (`lifespan.py`).
 - `backend/api/v1/` — API интеграций с общим префиксом `/api/v1`: пайплайны, документы, задачи и обработка.
-- `backend/api/` — административные маршруты пайплайнов, истории, документов и LiteLLM; адреса без версии используют общие обработчики v1 с сохранением прежних прав доступа.
-- `backend/schemas.py` — схемы запросов и сериализация ответов.
-- `backend/models.py`, `backend/database.py` — модели SQLAlchemy и соединения.
-- `backend/services.py` — общий сервис синхронной и фоновой обработки.
-- `backend/repositories.py` — сохранение документов, аренды задач и transactional outbox.
-- `backend/migrate.py`, `backend/migrations/` — миграции Alembic.
-- `backend/access.py`, `backend/throttle.py`, `backend/security.py` — доступ, общий ограничитель входа и скрытие секретов.
-- `backend/processing.py` — чтение документов, OCR и LiteLLM.
+- `backend/api/` — административные маршруты, вход (`auth.py`), ключи и клиенты (`keys.py`), политики доступа (`policies.py`); адреса без версии используют общие обработчики v1 с сохранением прежних прав доступа.
+- `backend/schema/` — конфигурация пайплайна (`pipeline.py`), контракты HTTP (`api.py`, `access.py`).
+- `backend/service/` — обработка документа (`processing.py`), распознавание и извлечение (`recognition.py`), проверка ответа модели (`validation.py`), задачи, учётные записи и ограничитель входа.
+- `backend/handler/` — внешний мир: LiteLLM (`litellm.py`), OCR-сервис (`ocr_service.py`), чтение файлов (`documents.py`), S3 (`storage.py`), Keycloak.
+- `backend/db/` — таблицы (`domain/models.py`), соединения и репозитории (`infra/`), миграции Alembic (`migrate.py`, `migration/`).
+- `backend/worker/` — Celery (`celery_app.py`), воркер (`tasks.py`) и диспетчер доставки/восстановления (`dispatcher.py`).
 - `app/api/[...path]/route.ts` — передача запросов из интерфейса в Python без CORS.
-- `backend/celery_app.py`, `backend/tasks.py`, `backend/dispatcher.py` — Celery, воркер и диспетчер доставки/восстановления.
 - `scripts/run-app.mjs` — подготовка Python и управление локальными процессами.
 
 ```powershell
@@ -422,7 +440,7 @@ npm run build         # сборка интерфейса
 npm start             # API + воркер + диспетчер + собранный интерфейс
 ```
 
-Python API слушает `127.0.0.1:8000`, интерфейс — `127.0.0.1:5173`. Порты можно изменить через `BACKEND_PORT` и `PORT`. `BACKEND_URL` позволяет направить интерфейс к отдельно размещённому API. Для отдельного запуска Python: `.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000` (Linux/macOS: `.venv/bin/python`).
+Python API слушает `127.0.0.1:8000`, интерфейс — `127.0.0.1:5173`. Порты можно изменить через `BACKEND_PORT` и `PORT`. `BACKEND_URL` позволяет направить интерфейс к отдельно размещённому API. Для отдельного запуска Python: `.venv\Scripts\python.exe -m uvicorn backend.server:app --host 127.0.0.1 --port 8000` (Linux/macOS: `.venv/bin/python`).
 
 Развёртывание требует Docker либо сервера с Node.js и Python, PostgreSQL и доступа к S3. Сохраняйте Docker volume PostgreSQL и папку `data` между запусками. Старый сценарий публикации в Cloudflare Workers/Sites больше не используется. Для доступа извне поставьте reverse proxy с HTTPS перед портом интерфейса и задайте `OCR_SECURE_COOKIE=1`; порт Python API наружу не открывайте.
 

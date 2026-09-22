@@ -3,7 +3,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 
-from ..access import COOKIE, public
+from .policies import COOKIE, public
 
 router = APIRouter(tags=["Authentication"])
 STATE_COOKIE = "ocr_oidc_state"

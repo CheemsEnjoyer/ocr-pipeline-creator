@@ -15,8 +15,6 @@ import ExtractionFields from "@/components/ExtractionFields";
 import { validFields, serializeFields } from "@/lib/extraction-fields";
 import { savePipeline } from "@/lib/pipelines";
 
-const validPipelineId = (value) => /^[a-zA-Z0-9_-]{1,80}$/.test(value);
-const sanitizePipelineId = (value) => value.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
 // Redis transport uses inverse priority values: 0 is highest, 9 is lowest.
 const PRIORITIES = [[9, "Низкий"], [5, "Обычный"], [0, "Высокий"]];
 
@@ -36,7 +34,6 @@ const initialFields = [
 
 export default function PipelineEditor({ initialPipeline = null, onCreateNew }) {
   const [step, setStep] = useState(1);
-  const [pipelineId, setPipelineId] = useState(initialPipeline?.id ?? "");
   const [name, setName] = useState(initialPipeline?.name ?? "Обработка входящих счетов");
   const [description, setDescription] = useState(initialPipeline?.description ?? "");
   const [priority, setPriority] = useState(initialPipeline?.priority ?? 5);
@@ -81,7 +78,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
 
 
   const isValid = useMemo(() => {
-    if (step === 1) return name.trim().length >= 3 && validPipelineId(pipelineId) && (allowSync || allowAsync) && (!allowAsync || validConcurrency(asyncConcurrency));
+    if (step === 1) return name.trim().length >= 3 && (allowSync || allowAsync) && (!allowAsync || validConcurrency(asyncConcurrency));
     if (step === 2) return Boolean(sourceType);
     if (step === 3) {
       const ocrValid = sourceType !== "scans" || !ocrEnabled || (ocrMode === "litellm" ? Boolean(ocrModel) && validTemperature(ocrTemperature) && visionPrompt.trim().length > 0 : /^https?:\/\//.test(ocrServiceUrl));
@@ -89,13 +86,13 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
       return ocrValid && (skipExtraction || (validTemperature(extractionTemperature) && Boolean(llmModel) && Number.isInteger(Number(maxTokens)) && maxTokens >= 1 && maxTokens <= 128000 && (!promptEnabled || prompt.trim().length > 0) && (!fieldsEnabled || fieldsValid)));
     }
     return true;
-  }, [ocrEnabled, ocrTemperature, extractionTemperature, step, name, pipelineId, allowSync, allowAsync, asyncConcurrency, sourceType, ocrMode, ocrModel, ocrServiceUrl, visionPrompt, skipExtraction, llmModel, maxTokens, promptEnabled, fieldsEnabled, prompt, fields]);
+  }, [ocrEnabled, ocrTemperature, extractionTemperature, step, name, allowSync, allowAsync, asyncConcurrency, sourceType, ocrMode, ocrModel, ocrServiceUrl, visionPrompt, skipExtraction, llmModel, maxTokens, promptEnabled, fieldsEnabled, prompt, fields]);
 
   // Поля формы сохранённого пайплайна не теряются при редактировании.
   const serviceOptions = initialPipeline?.ocr?.url === ocrServiceUrl ? initialPipeline?.ocr?.options ?? {} : {};
 
   const pipeline = {
-    id: pipelineId, name: name.trim(), description: description.trim(), priority: Number(priority), allow_sync: allowSync, allow_async: allowAsync, async_concurrency: Number(asyncConcurrency), source: sourceType,
+    ...(savedId ? { id: savedId } : {}), name: name.trim(), description: description.trim(), priority: Number(priority), allow_sync: allowSync, allow_async: allowAsync, async_concurrency: Number(asyncConcurrency), source: sourceType,
     ocr: sourceType === "scans" ? (ocrMode === "litellm" ? { enabled: ocrEnabled, provider: "litellm", model: ocrModel, temperature: Number(ocrTemperature), prompt: visionPrompt } : { enabled: ocrEnabled, provider: "service", url: ocrServiceUrl || null, ...(Object.keys(serviceOptions).length ? { options: serviceOptions } : {}) }) : null,
     extraction: { mode: fieldsEnabled ? "fields" : "prompt", prompt_enabled: promptEnabled, fields_enabled: fieldsEnabled, model: llmModel, max_tokens: Number(maxTokens), temperature: Number(extractionTemperature), prompt, fields: serializeFields(fields) },
   };
@@ -103,7 +100,6 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
   const finish = async () => {
     if (savingRef.current) return;
     setSaveError("");
-    if (!validPipelineId(pipelineId)) { setSaveError("Укажите ID: от 1 до 80 латинских букв, цифр, символов _ или -."); setStep(1); return; }
     const fieldsValid = validFields(fields);
     if (name.trim().length < 3 || (!allowSync && !allowAsync) || (allowAsync && !validConcurrency(asyncConcurrency)) || (sourceType === "scans" && ocrEnabled && (ocrMode === "litellm" ? !ocrModel || !validTemperature(ocrTemperature) || !visionPrompt.trim() : !/^https?:\/\//.test(ocrServiceUrl))) || (!skipExtraction && (!validTemperature(extractionTemperature) || !llmModel || Number(maxTokens) < 1 || Number(maxTokens) > 128000 || !Number.isInteger(Number(maxTokens)) || ((promptEnabled && !prompt.trim()) || (fieldsEnabled && !fieldsValid))))) {
       setSaveError("Проверьте название, настройки OCR и извлечения. Названия полей должны быть уникальными."); return;
@@ -122,8 +118,8 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
     const lifecycle = new AbortController();
     try { void Promise.resolve(context.registerTool({
       name: "configure_ocr_pipeline", title: "Настроить OCR-пайплайн", description: "Заполняет основные параметры мастера создания OCR-пайплайна.",
-      inputSchema: { type: "object", properties: { id: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,80}$" }, name: { type: "string" }, priority: { type: "integer", minimum: 0, maximum: 9 }, allowSync: { type: "boolean" }, allowAsync: { type: "boolean" }, asyncConcurrency: { type: "integer", minimum: 1, maximum: 30 }, source: { type: "string", enum: ["scans", "document"] }, extractionMode: { type: "string", enum: ["prompt", "fields"] }, promptEnabled: { type: "boolean" }, fieldsEnabled: { type: "boolean" }, model: { type: "string" }, maxTokens: { type: "integer", minimum: 1 } }, required: ["id", "name", "source", "model", "maxTokens"], additionalProperties: false },
-      annotations: { readOnlyHint: false, untrustedContentHint: false }, execute(input) { if (!savedId) setPipelineId(sanitizePipelineId(input.id)); setName(input.name); setPriority(input.priority ?? 5); setAllowSync(input.allowSync ?? true); setAllowAsync(input.allowAsync ?? true); setAsyncConcurrency(input.asyncConcurrency ?? 1); setSourceType(input.source); setPromptEnabled(input.promptEnabled ?? input.extractionMode === "prompt"); setFieldsEnabled(input.fieldsEnabled ?? input.extractionMode !== "prompt"); setLlmModel(input.model); setMaxTokens(input.maxTokens); setStep(3); return { configured: true, name: input.name }; },
+      inputSchema: { type: "object", properties: { name: { type: "string" }, priority: { type: "integer", minimum: 0, maximum: 9 }, allowSync: { type: "boolean" }, allowAsync: { type: "boolean" }, asyncConcurrency: { type: "integer", minimum: 1, maximum: 30 }, source: { type: "string", enum: ["scans", "document"] }, extractionMode: { type: "string", enum: ["prompt", "fields"] }, promptEnabled: { type: "boolean" }, fieldsEnabled: { type: "boolean" }, model: { type: "string" }, maxTokens: { type: "integer", minimum: 1 } }, required: ["name", "source", "model", "maxTokens"], additionalProperties: false },
+      annotations: { readOnlyHint: false, untrustedContentHint: false }, execute(input) { setName(input.name); setPriority(input.priority ?? 5); setAllowSync(input.allowSync ?? true); setAllowAsync(input.allowAsync ?? true); setAsyncConcurrency(input.asyncConcurrency ?? 1); setSourceType(input.source); setPromptEnabled(input.promptEnabled ?? input.extractionMode === "prompt"); setFieldsEnabled(input.fieldsEnabled ?? input.extractionMode !== "prompt"); setLlmModel(input.model); setMaxTokens(input.maxTokens); setStep(3); return { configured: true, name: input.name }; },
     }, { signal: lifecycle.signal })).catch(() => undefined); } catch { /* WebMCP is optional. */ }
     return () => lifecycle.abort();
   }, [savedId]);
@@ -136,7 +132,7 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
       <aside className="step-sidebar"><div><p className="eyebrow">{initialPipeline ? "РЕДАКТИРОВАНИЕ" : "НОВЫЙ ПАЙПЛАЙН"}</p><h2>Ответьте на 3 вопроса</h2><p className="sidebar-copy">Мы соберём готовую конфигурацию обработки документов.</p></div><nav aria-label="Шаги настройки">{stepMeta.map((item) => <button key={item.number} className={`${step === item.number ? "active" : ""} ${step > item.number ? "complete" : ""}`} onClick={() => setStep(item.number)}><span>{step > item.number ? <Check size={15}/> : item.number}</span><div><strong>{item.title}</strong><small>{item.short}</small></div></button>)}</nav></aside>
 
       <section className="question-area"><div className="progress-row"><span>Шаг {step} из 3</span><div><i style={{ width: `${Math.round(step / 3 * 100)}%` }}/></div><strong>{Math.round(step / 3 * 100)}%</strong></div><div className="question-card">
-        {step === 1 && <StepName description={description} setDescription={setDescription} name={name} setName={setName} pipelineId={pipelineId} setPipelineId={setPipelineId} priority={priority} setPriority={setPriority} allowSync={allowSync} setAllowSync={setAllowSync} allowAsync={allowAsync} setAllowAsync={setAllowAsync} asyncConcurrency={asyncConcurrency} setAsyncConcurrency={setAsyncConcurrency} idLocked={Boolean(savedId)}/>}
+        {step === 1 && <StepName description={description} setDescription={setDescription} name={name} setName={setName} pipelineId={savedId} priority={priority} setPriority={setPriority} allowSync={allowSync} setAllowSync={setAllowSync} allowAsync={allowAsync} setAllowAsync={setAllowAsync} asyncConcurrency={asyncConcurrency} setAsyncConcurrency={setAsyncConcurrency}/>}
         {step === 2 && <StepSource sourceType={sourceType} setSourceType={setSourceType}/>}
         {step === 3 && <div className="step-content"><StepHeading icon={Sparkles} kicker="ОБРАБОТКА ДОКУМЕНТА" title="Промпт и поля в одном этапе" copy="Включайте нужные действия независимо. Без промпта и полей результатом будет исходный текст."/>
           {sourceType === "scans" && <><ToggleSection title="Распознавание сканов" copy="Vision-модель с промптом или внешний OCR-сервис." checked={ocrEnabled} onChange={setOcrEnabled}/>{ocrEnabled ? <StepOcr temperature={ocrTemperature} setTemperature={setOcrTemperature} sourceType={sourceType} ocrMode={ocrMode} setOcrMode={setOcrMode} ocrModel={ocrModel} setOcrModel={setOcrModel} ocrServiceUrl={ocrServiceUrl} setOcrServiceUrl={setOcrServiceUrl} visionPrompt={visionPrompt} setVisionPrompt={setVisionPrompt} models={models} modelsLoading={modelsLoading} modelError={modelError}/> : <p className="sidebar-copy">Будет прочитан текстовый слой файла. Для изображений и PDF без текста включите распознавание.</p>}</>}
@@ -150,11 +146,11 @@ export default function PipelineEditor({ initialPipeline = null, onCreateNew }) 
   </main>;
 }
 
-function StepName({ description, setDescription, name, setName, pipelineId, setPipelineId, priority, setPriority, allowSync, setAllowSync, allowAsync, setAllowAsync, asyncConcurrency, setAsyncConcurrency, idLocked }) {
+function StepName({ description, setDescription, name, setName, pipelineId, priority, setPriority, allowSync, setAllowSync, allowAsync, setAllowAsync, asyncConcurrency, setAsyncConcurrency }) {
   return <div className="step-content">
     <StepHeading icon={FileInput} kicker="НАЧНЁМ С ОСНОВНОГО" title="Как назовём пайплайн?" copy="Название поможет быстро найти его в списке и понять назначение."/>
     <div className="main-field"><Label htmlFor="pipeline-name">Название пайплайна</Label><Input id="pipeline-name" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Например, обработка входящих счетов"/><small>{name.length} / 80</small></div>
-    <div className="main-field"><Label htmlFor="pipeline-id">ID пайплайна</Label><Input id="pipeline-id" value={pipelineId} readOnly={idLocked} maxLength={80} required spellCheck={false} autoCapitalize="none" aria-describedby="pipeline-id-help" aria-invalid={!idLocked && pipelineId.length > 0 && !validPipelineId(pipelineId)} onChange={(event) => setPipelineId(sanitizePipelineId(event.target.value))} placeholder="Например, invoices_2026"/><small id="pipeline-id-help">{idLocked ? "ID используется в API и не меняется после сохранения." : "Только латинские буквы, цифры, _ и -. Кириллица и пробелы не вводятся. После сохранения ID изменить нельзя."}</small></div>
+    <div className="main-field"><Label htmlFor="pipeline-id">ID пайплайна</Label><Input id="pipeline-id" value={pipelineId ?? ""} readOnly aria-describedby="pipeline-id-help" placeholder="Будет создан автоматически"/><small id="pipeline-id-help">{pipelineId ? "ID используется в API и не меняется после сохранения." : "UUID генерируется автоматически при сохранении."}</small></div>
     <div className="execution-settings">
       <ToggleSection title="Синхронный запуск" copy="Запрос ждёт завершения обработки и сразу получает результат." checked={allowSync} onChange={(checked) => { if (checked || allowAsync) setAllowSync(checked); }}/>
       <ToggleSection title="Асинхронный запуск" copy="Документ попадает в очередь Celery, результат запрашивается по ID задачи." checked={allowAsync} onChange={(checked) => { if (checked || allowSync) setAllowAsync(checked); }}/>

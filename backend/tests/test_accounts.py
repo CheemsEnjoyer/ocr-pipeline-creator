@@ -3,8 +3,8 @@ import unittest
 from urllib.parse import urlsplit, parse_qs
 
 from fastapi.testclient import TestClient
-from backend.models import User
-from backend.accounts import hash_password, verify_password
+from backend.db.domain.models import User
+from backend.service.accounts import hash_password, verify_password
 from backend.tests import test_api
 
 
@@ -41,9 +41,11 @@ class UserTests(unittest.TestCase):
         self.assertEqual(browser.post("/api/users/invite", json={"login":"other", "name":"Other", "role":"admin"}).status_code, 403)
         self.assertEqual(browser.patch(f"/api/users/{user['id']}", json={"role":"admin"}).status_code, 403)
         self.assertEqual(browser.post("/api/pipelines", json={"id":"forbidden", "name":"Forbidden", "source":"document"}).status_code, 403)
-        self.client.post("/api/pipelines", json={"id":"shared", "name":"Shared", "source":"document"})
-        self.assertEqual(browser.get("/api/pipelines").json()["pipelines"][0]["id"], "shared")
-        processed = browser.post("/api/pipelines/shared/run", files={"file":("text.txt", b"Shared document", "text/plain")})
+        created = self.client.post("/api/pipelines", json={"name":"Shared", "source":"document"})
+        self.assertEqual(created.status_code, 201, created.text)
+        pipeline_id = created.json()["pipeline"]["id"]
+        self.assertEqual(browser.get("/api/pipelines").json()["pipelines"][0]["id"], pipeline_id)
+        processed = browser.post(f"/api/pipelines/{pipeline_id}/run", files={"file":("text.txt", b"Shared document", "text/plain")})
         self.assertEqual(processed.status_code, 200, processed.text)
         self.assertEqual(len(browser.get("/api/documents").json()["documents"]), 1)
         self.assertEqual(browser.get("/api/history/pipelines").status_code, 200)

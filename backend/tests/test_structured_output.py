@@ -3,10 +3,11 @@ import unittest
 from unittest.mock import patch
 
 import httpx
-from fastapi import HTTPException
 from pydantic import ValidationError
 
-from backend.processing import Extraction, extract, fields_schema
+from backend.core.errors import UpstreamError
+from backend.schema.pipeline import Extraction, fields_schema
+from backend.service.recognition import extract
 
 
 class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
@@ -80,20 +81,20 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
             '{"total":NaN,"invoice/date":null}',
             '{"total":"first","total":"second","invoice/date":null}',
         ):
-            with self.subTest(content=content), self.assertRaises(HTTPException) as raised:
+            with self.subTest(content=content), self.assertRaises(UpstreamError) as raised:
                 await self.request(content)
-            self.assertEqual(raised.exception.status_code, 502)
+            self.assertEqual(raised.exception.status, 502)
 
     async def test_rejects_refusal_and_truncated_or_filtered_answers(self):
         for reason, refusal in (("length", None), ("content_filter", None), (None, None), ("stop", "refused")):
-            with self.subTest(reason=reason, refusal=refusal), self.assertRaises(HTTPException) as raised:
+            with self.subTest(reason=reason, refusal=refusal), self.assertRaises(UpstreamError) as raised:
                 await self.request('{"total":"1500","invoice/date":null}', reason, refusal)
-            self.assertEqual(raised.exception.status_code, 502)
+            self.assertEqual(raised.exception.status, 502)
 
     async def test_no_fallback_when_model_rejects_structured_output(self):
-        with self.assertRaises(HTTPException) as raised:
+        with self.assertRaises(UpstreamError) as raised:
             await self.request(None, status=400)
-        self.assertIn("Structured Output", raised.exception.detail)
+        self.assertIn("Structured Output", raised.exception.message)
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0]["response_format"]["type"], "json_schema")
 
@@ -131,7 +132,7 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
             {"objects": [{"name": "x", "price": 1, "count": 1, "active": "false", "address": None}]},
             {"objects": [{"name": "x", "price": 1, "count": 1, "active": False, "address": {"city": "X", "extra": 1}}]},
         ]:
-            with self.subTest(invalid=invalid), self.assertRaises(HTTPException):
+            with self.subTest(invalid=invalid), self.assertRaises(UpstreamError):
                 await self.request(json.dumps(invalid))
 
     def test_invalid_nested_configuration(self):

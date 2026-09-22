@@ -37,7 +37,7 @@ services:
     restart: unless-stopped
     env_file: *app-env-file
     environment: *app-environment
-    command: ["/app/.venv/bin/python", "-m", "celery", "-A", "backend.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=${OCR_WORKER_CONCURRENCY:-4}"]
+    command: ["/app/.venv/bin/python", "-m", "celery", "-A", "backend.worker.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=${OCR_WORKER_CONCURRENCY:-4}"]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -48,7 +48,7 @@ services:
     build: .
     env_file: *app-env-file
     environment: *app-environment
-    command: ["/app/.venv/bin/python", "-m", "backend.migrate"]
+    command: ["/app/.venv/bin/python", "-m", "backend.db.migrate"]
 
   dispatcher:
     image: ocr-pipeline-creator:local
@@ -57,7 +57,7 @@ services:
     restart: unless-stopped
     env_file: *app-env-file
     environment: *app-environment
-    command: ["/app/.venv/bin/python", "-m", "backend.dispatcher"]
+    command: ["/app/.venv/bin/python", "-m", "backend.worker.dispatcher"]
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -2,13 +2,13 @@ import logging
 import unittest
 from unittest.mock import patch
 
-from backend.config import JobSettings
-from backend.security import SecretFilter, safe_url
+from backend.core.config import JobSettings
+from backend.core.security import SecretFilter, safe_url
 
 
 class SecurityTests(unittest.TestCase):
     def test_oidc_codes_and_session_keys_are_redacted(self):
-        from backend.security import redact
+        from backend.core.security import redact
         with patch.dict("os.environ", {"KEYCLOAK_SESSION_KEY": "private-encryption-key"}):
             message = redact('GET /api/auth/keycloak/callback?state=private-state&code=private-code HTTP/1.1 private-encryption-key')
         for secret in ("private-state", "private-code", "private-encryption-key"):

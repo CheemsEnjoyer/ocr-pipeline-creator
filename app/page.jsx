@@ -49,7 +49,7 @@ export default function ProcessPage() {
     const controller = new AbortController();
     runController.current = controller;
     await Promise.all(items.filter((item) => item.status !== "done").map(async (item) => {
-      patch(item.id, { status: "processing", result: undefined, error: undefined });
+      patch(item.id, { status: "processing", stage: "queued", result: undefined, error: undefined });
       try {
         let taskId = item.taskId;
         if (!taskId) {
@@ -68,11 +68,14 @@ export default function ProcessPage() {
           if (!taskId) throw new Error("Сервер не вернул ID задачи");
           patch(item.id, { taskId });
         }
-        const result = await waitForJob(`/api/jobs/${encodeURIComponent(taskId)}`, { signal: controller.signal });
+        const result = await waitForJob(`/api/jobs/${encodeURIComponent(taskId)}`, {
+          signal: controller.signal,
+          onUpdate: (status) => patch(item.id, { stage: status.stage, attempts: status.attempts }),
+        });
         patch(item.id, { status: "done", result: result.result, documentId: result.documentId });
       } catch (error) {
         if (controller.signal.aborted) return;
-        patch(item.id, { status: "error", error: error.message || "Обработка не удалась" });
+        patch(item.id, { status: "error", stage: error.failedStage || error.stage, error: error.message || "Обработка не удалась" });
         if (error.taskFailed) patch(item.id, { taskId: undefined });
       }
     }));
@@ -104,7 +107,7 @@ export default function ProcessPage() {
           {items.map((item) => <article className={`file-card ${item.status}`} key={item.id}>
             <div className="file-icon"><FileText size={18}/></div>
             <div className="file-meta"><strong>{item.file.name}</strong><small>{formatSize(item.file.size)} · {item.file.type || "неизвестный тип"}</small></div>
-            <FileStatus status={item.status}/>
+            <FileStatus status={item.status} stage={item.stage}/>
             <button className="remove-field" onClick={() => setItems(items.filter((entry) => entry.id !== item.id))} disabled={running} aria-label="Удалить файл"><Trash2 size={16}/></button>
             {item.status === "error" && <p className="file-error"><AlertCircle size={14}/>{item.error}</p>}
             {item.status === "done" && <div className="processed-document-link"><Check size={15}/><span>Сохранён в истории</span><Button variant="outline" size="sm" asChild><a href={`/history?document=${encodeURIComponent(item.documentId)}`}>Открыть документ<ChevronRight size={15}/></a></Button></div>}
@@ -143,9 +146,11 @@ export default function ProcessPage() {
   </main>;
 }
 
-function FileStatus({ status }) {
-  if (status === "processing") return <span className="file-status processing"><LoaderCircle size={13} className="spin"/>Обработка</span>;
+const STAGE_LABELS = { queued: "В очереди", downloading: "Загрузка файла", recognition: "Распознавание", extraction: "Извлечение", validation: "Проверка результата", saving: "Сохранение", completed: "Готово" };
+
+function FileStatus({ status, stage }) {
+  if (status === "processing") return <span className="file-status processing"><LoaderCircle size={13} className="spin"/>{STAGE_LABELS[stage] || "Обработка"}</span>;
   if (status === "done") return <span className="file-status done"><Check size={13}/>Готово</span>;
-  if (status === "error") return <span className="file-status error"><AlertCircle size={13}/>Ошибка</span>;
+  if (status === "error") return <span className="file-status error"><AlertCircle size={13}/>Ошибка{stage && STAGE_LABELS[stage] ? `: ${STAGE_LABELS[stage]}` : ""}</span>;
   return <span className="file-status">В очереди</span>;
 }

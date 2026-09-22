@@ -3,11 +3,11 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import select, update
-from ..access import workspace_only
-from ..models import Document, SavedPipeline
-from ..repositories import now
-from ..schemas import FieldUpdate
-from ..storage import TemporaryFileResponse
+from .policies import workspace_only
+from ..db.domain.models import Document, SavedPipeline
+from ..db.infra.repositories import now
+from ..schema.api import FieldUpdate
+from ..handler.storage import TemporaryFileResponse
 
 
 def create_router(app, storage):

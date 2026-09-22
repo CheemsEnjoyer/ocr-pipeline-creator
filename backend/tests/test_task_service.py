@@ -2,13 +2,14 @@ import unittest
 from unittest.mock import patch
 
 from sqlalchemy import func, select
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from backend.database import open_database
-from backend.migrate import migrate
-from backend.models import DocumentType, File, Task, TaskStatus
-from backend.schemas import InitTaskRequestDTO
-from backend.task_service import TaskService
+from backend.db.infra.engine import open_database
+from backend.db.migrate import migrate
+from backend.db.domain.models import DocumentType, File, Task, TaskStatus
+from backend.schema.api import InitTaskRequestDTO
+from backend.service.tasks import TaskService
 
 
 class TaskServiceTests(unittest.TestCase):
@@ -19,7 +20,8 @@ class TaskServiceTests(unittest.TestCase):
         self.db = sessions()
         self.addCleanup(self.db.close)
         self.request = InitTaskRequestDTO(task_code="task-1", callback_url="https://integration.test/callback",
-                                             document_link="s3://documents/input.pdf")
+                                             document_link="s3://documents/input.pdf",
+                                             content_type="application/pdf")
 
     def test_create_and_read(self):
         self.assertTrue(TaskService.create_task(self.request, self.db))
@@ -30,6 +32,7 @@ class TaskServiceTests(unittest.TestCase):
         self.assertEqual(doc_type.name, "generic")
         self.assertEqual(callback, self.request.callback_url)
         self.assertEqual(file.s3_link, self.request.document_link)
+        self.assertEqual(file.content_type, self.request.content_type)
         self.assertEqual(task.file.task_id, task.id)
 
     def test_custom_document_type(self):
@@ -44,6 +47,11 @@ class TaskServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DocumentType 'unknown' not found"):
             TaskService.create_task(request, self.db)
         self.assertFalse(TaskService.is_task_existing(request.task_code, self.db))
+
+    def test_content_type_is_required(self):
+        with self.assertRaises(ValidationError):
+            InitTaskRequestDTO(task_code="task-2", callback_url="https://integration.test/callback",
+                               document_link="s3://documents/input.pdf")
 
     def test_missing_task(self):
         self.assertFalse(TaskService.is_task_existing("missing", self.db))

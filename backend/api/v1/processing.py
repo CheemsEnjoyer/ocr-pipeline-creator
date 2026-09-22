@@ -3,10 +3,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
-from ...access import integration_allowed, require_permission
-from ...models import SavedPipeline
-from ...processing import Pipeline
-from ...config import MAX_FILE_SIZE
+from ..policies import integration_allowed, require_permission
+from ...db.domain.models import SavedPipeline
+from ...schema.pipeline import Pipeline
+from ...core.config import MAX_FILE_SIZE
 
 
 def create_router(app, storage):

@@ -2,10 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
-from ...access import integration_allowed, require_permission, client_visible
-from ...models import Document, ProcessingJob
-from ...repositories import add_outbox, ensure_client_job_capacity, now
-from ...schemas import public_result
+from ..policies import client_visible, integration_allowed, require_permission
+from ...db.domain.models import Document, ProcessingJob
+from ...db.infra.repositories import add_outbox, ensure_client_job_capacity, now
+from ...schema.api import public_result
 
 
 def create_router(app, storage):
@@ -17,7 +17,9 @@ def create_router(app, storage):
             job = session.scalar(client_visible(select(ProcessingJob).where(ProcessingJob.id == job_id), ProcessingJob, request))
             if job is None:
                 raise HTTPException(404, "Задача не найдена")
-            payload = {"taskId": job.id, "status": job.status, "file": job.filename, "attempts": job.attempts}
+            payload = {"taskId": job.id, "status": job.status, "stage": job.stage, "file": job.filename, "attempts": job.attempts}
+            if job.failed_stage:
+                payload["failedStage"] = job.failed_stage
             if job.status == "failed":
                 payload["error"] = job.error
             elif job.status == "succeeded":
@@ -37,7 +39,7 @@ def create_router(app, storage):
                 if job.status not in {"queued", "failed"}:
                     raise HTTPException(409, "Задача уже выполняется или завершена")
                 ensure_client_job_capacity(session, job.client_id, app.state.processing.settings.client_active_limit, job.id)
-                job.status, job.error, job.updated_at = "queued", None, now()
+                job.status, job.stage, job.failed_stage, job.error, job.updated_at = "queued", "queued", None, None, now()
                 job.generation += 1
                 job.attempts, job.next_run_at, job.deadline_at = 0, 0, None
                 job.lease_token, job.lease_until = None, None

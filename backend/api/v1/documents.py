@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import or_, select
 from sqlalchemy.orm import load_only
-from ...access import integration_allowed, require_permission, client_visible
-from ...models import Document
-from ...schemas import serialize, public_result
+from ..policies import client_visible, integration_allowed, require_permission
+from ...db.domain.models import Document
+from ...schema.api import serialize, public_result
 
 
 def create_router(app, storage, policy=integration_allowed):

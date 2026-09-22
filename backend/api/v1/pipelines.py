@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
-from ...access import integration_allowed
-from ...models import SavedPipeline
-from ...schemas import serialize_pipeline, serialize_public_pipeline
+from ..policies import integration_allowed
+from ...db.domain.models import SavedPipeline
+from ...schema.api import serialize_pipeline, serialize_public_pipeline
 
 
 def create_router(app, storage):

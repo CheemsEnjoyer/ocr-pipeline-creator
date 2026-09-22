@@ -1,27 +1,23 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.exc import IntegrityError
-from ..access import admin_only
-from ..models import SavedPipeline
-from ..repositories import now
-from ..schemas import PipelineImport, PipelineUpdate, serialize_pipeline
+from .policies import admin_only
+from ..db.domain.models import SavedPipeline
+from ..db.infra.repositories import now
+from ..schema.pipeline import Pipeline
+from ..schema.api import PipelineImport, PipelineUpdate, serialize_pipeline
 
 
 def create_router(app, storage):
     router = APIRouter(tags=["Pipelines"])
 
     @router.post("/api/pipelines", status_code=201, dependencies=[Depends(admin_only)])
-    def create_pipeline(payload: PipelineImport):
+    def create_pipeline(payload: Pipeline):
         timestamp = now()
         with app.state.sessions() as session:
-            if session.get(SavedPipeline, payload.id) is not None:
-                raise HTTPException(409, "Этот ID пайплайна уже занят. Укажите другой ID.")
-            row = SavedPipeline(id=payload.id, config=payload.model_dump(mode="json", exclude={"id"}), created_at=timestamp, updated_at=timestamp)
+            row = SavedPipeline(id=str(uuid4()), config=payload.model_dump(mode="json"), created_at=timestamp, updated_at=timestamp)
             session.add(row)
-            try:
-                session.commit()
-            except IntegrityError as error:
-                session.rollback()
-                raise HTTPException(409, "Этот ID пайплайна уже занят. Укажите другой ID.") from error
+            session.commit()
             return {"pipeline": serialize_pipeline(row)}
 
     @router.post("/api/pipelines/import", dependencies=[Depends(admin_only)])
